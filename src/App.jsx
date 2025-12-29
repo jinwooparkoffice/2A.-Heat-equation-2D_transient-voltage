@@ -908,9 +908,9 @@ function App() {
       // 시뮬레이션 요약
       sheet5Data.push(['시뮬레이션 요약', ''])
       sheet5Data.push(['시작 온도 (°C)', Number(stats.startTemp)])
-      sheet5Data.push(['페로브스카이트 중간 z 최고온도 (°C)', stats.perovskiteMaxTemp !== null ? Number(stats.perovskiteMaxTemp) : 'N/A'])
-      sheet5Data.push(['페로브스카이트 중간 z 최저온도 (°C)', stats.perovskiteMinTemp !== null ? Number(stats.perovskiteMinTemp) : 'N/A'])
-      sheet5Data.push(['페로브스카이트 중간 z 평균온도 (°C)', stats.perovskiteAvgTemp !== null ? Number(stats.perovskiteAvgTemp) : 'N/A'])
+      sheet5Data.push(['페로브스카이트층 최고온도 (°C)', stats.perovskiteMaxTemp !== null ? Number(stats.perovskiteMaxTemp) : 'N/A'])
+      sheet5Data.push(['페로브스카이트층 최저온도 (°C)', stats.perovskiteMinTemp !== null ? Number(stats.perovskiteMinTemp) : 'N/A'])
+      sheet5Data.push(['페로브스카이트층 평균온도 (°C)', stats.perovskiteAvgTemp !== null ? Number(stats.perovskiteAvgTemp) : 'N/A'])
       sheet5Data.push(['소자 내부 최대 온도 (°C)', stats.maxTemp !== null ? Number(stats.maxTemp) : 'N/A'])
       sheet5Data.push(['소자 내부 최소 온도 (°C)', stats.minTemp !== null ? Number(stats.minTemp) : 'N/A'])
       sheet5Data.push(['소자 내부 온도 차이 (Vertical) (°C)', stats.tempDifference !== null ? Number(stats.tempDifference) : 'N/A'])
@@ -2296,19 +2296,19 @@ function App() {
                       gap: '15px'
                     }}>
                       <div>
-                        <div style={{ fontSize: '0.9em', color: '#666', marginBottom: '5px' }}>페로브스카이트 중간 z 최고온도</div>
+                        <div style={{ fontSize: '0.9em', color: '#666', marginBottom: '5px' }}>페로브스카이트층 최고온도</div>
                         <div style={{ fontSize: '1.2em', fontWeight: 'bold', color: '#dc2626' }}>
                           {stats.perovskiteMaxTemp !== null && stats.perovskiteMaxTemp !== undefined ? `${stats.perovskiteMaxTemp.toFixed(2)} °C` : 'N/A'}
                         </div>
                       </div>
                       <div>
-                        <div style={{ fontSize: '0.9em', color: '#666', marginBottom: '5px' }}>페로브스카이트 중간 z 최저온도</div>
+                        <div style={{ fontSize: '0.9em', color: '#666', marginBottom: '5px' }}>페로브스카이트층 최저온도</div>
                         <div style={{ fontSize: '1.2em', fontWeight: 'bold', color: '#2563eb' }}>
                           {stats.perovskiteMinTemp !== null && stats.perovskiteMinTemp !== undefined ? `${stats.perovskiteMinTemp.toFixed(2)} °C` : 'N/A'}
                         </div>
                       </div>
                       <div>
-                        <div style={{ fontSize: '0.9em', color: '#666', marginBottom: '5px' }}>페로브스카이트 중간 z 평균온도</div>
+                        <div style={{ fontSize: '0.9em', color: '#666', marginBottom: '5px' }}>페로브스카이트층 평균온도</div>
                         <div style={{ fontSize: '1.2em', fontWeight: 'bold', color: '#16a34a' }}>
                           {stats.perovskiteAvgTemp !== null && stats.perovskiteAvgTemp !== undefined ? `${stats.perovskiteAvgTemp.toFixed(2)} °C` : 'N/A'}
                         </div>
