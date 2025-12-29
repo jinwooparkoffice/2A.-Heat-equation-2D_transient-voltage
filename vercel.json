@@ -1,12 +1,6 @@
 {
   "buildCommand": "pnpm build",
   "outputDirectory": "dist",
-  "framework": null,
-  "rewrites": [
-    {
-      "source": "/api/(.*)",
-      "destination": "/api/index"
-    }
-  ]
+  "framework": null
 }
 

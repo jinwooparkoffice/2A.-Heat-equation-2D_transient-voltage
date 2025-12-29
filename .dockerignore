@@ -67,3 +67,4 @@ tests/
 # Results directory (런타임에 생성됨)
 /tmp/heat_eq_results
 
+

@@ -258,11 +258,22 @@ function App() {
           const progressData = await progressResponse.json()
           setProgress({ progress: progressData.progress || 0, message: progressData.message || '' })
           
+          // 취소 상태 확인
+          if (progressData.message === '취소됨' || progressData.error === '시뮬레이션이 취소되었습니다.') {
+            console.log('시뮬레이션이 취소되었습니다.')
+            setError('시뮬레이션이 취소되었습니다.')
+            if (progressInterval) clearInterval(progressInterval)
+            setLoading(false)
+            setSessionId(null)
+            return
+          }
+          
           // 오류가 있으면 표시
           if (progressData.error) {
             setError(progressData.error)
             if (progressInterval) clearInterval(progressInterval)
             setLoading(false)
+            setSessionId(null)
             return
           }
           
@@ -375,6 +386,49 @@ function App() {
       // 진행률 폴링은 데이터 변환 완료 후에만 중지
       // (finally 블록에서 즉시 중지하지 않음)
       console.log('API 요청 완료 (finally 블록)')
+    }
+  }
+
+  // 시뮬레이션 중단 함수
+  const handleCancel = async () => {
+    if (!sessionId) {
+      console.warn('취소할 시뮬레이션이 없습니다.')
+      return
+    }
+
+    try {
+      const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 
+                           (import.meta.env.DEV ? '' : 'https://jouleheatingsimulation-2d.fly.dev')
+      const cancelUrl = `${API_BASE_URL}/api/cancel/${sessionId}`
+      
+      console.log('시뮬레이션 취소 요청 전송 중...', { url: cancelUrl, sessionId })
+      
+      const response = await fetch(cancelUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      })
+
+      if (!response.ok) {
+        const errorText = await response.text()
+        console.error('취소 요청 실패:', errorText)
+        setError(`취소 요청 실패: ${errorText}`)
+        return
+      }
+
+      const cancelData = await response.json()
+      console.log('취소 요청 성공:', cancelData)
+      
+      // 상태 초기화
+      setLoading(false)
+      setProgress({ progress: 0, message: '취소됨' })
+      setSessionId(null)
+      
+      // 진행률 폴링 중지 (다음 진행률 조회에서 취소 상태 확인)
+    } catch (err) {
+      console.error('취소 요청 오류:', err)
+      setError(`취소 요청 중 오류: ${err.message}`)
     }
   }
 
@@ -628,16 +682,69 @@ function App() {
       }
     }
     
-    // 하단 끝 온도 (Glass 시작점, r=0, z=0)
-    let bottomTemp = null
-    if (temp_profile_r0_z && temp_profile_r0_z.length > 0) {
-      bottomTemp = temp_profile_r0_z[0] // 첫 번째 값이 z=0 (Glass 시작점)
-    }
-    
-    // 상단 끝 온도 (Cathode 끝, r=0, z=최대)
-    let topTemp = null
-    if (temp_profile_r0_z && temp_profile_r0_z.length > 0) {
-      topTemp = temp_profile_r0_z[temp_profile_r0_z.length - 1] // 마지막 값이 z=최대 (Cathode 끝)
+    // 페로브스카이트 중간 z에서 최고온도/최저온도/평균온도 (넓이 고려)
+    let perovskiteMaxTemp = null, perovskiteMinTemp = null, perovskiteAvgTemp = null
+    if (temp_profile_z_perovskite_r && r_mm && device_radius_mm && 
+        temp_profile_z_perovskite_r.length > 0 && r_mm.length > 0 && 
+        temp_profile_z_perovskite_r.length === r_mm.length) {
+      try {
+        // r=0부터 소자 반지름까지의 데이터만 필터링
+        const filteredData = []
+        for (let i = 0; i < r_mm.length && i < temp_profile_z_perovskite_r.length; i++) {
+          if (r_mm[i] <= device_radius_mm) {
+            filteredData.push({
+              r: r_mm[i], // mm 단위
+              temp: temp_profile_z_perovskite_r[i]
+            })
+          }
+        }
+        
+        if (filteredData.length > 0) {
+          // 최고온도, 최저온도
+          perovskiteMaxTemp = Math.max(...filteredData.map(d => d.temp))
+          perovskiteMinTemp = Math.min(...filteredData.map(d => d.temp))
+          
+          // 넓이를 고려한 평균온도 계산 (원통좌표계: 넓이 요소 = 2πr dr)
+          // 가중평균 = Σ(T(r_i) * r_i * dr_i) / Σ(r_i * dr_i)
+          let weightedSum = 0
+          let weightSum = 0
+          
+          for (let i = 0; i < filteredData.length; i++) {
+            const r = filteredData[i].r * 1e-3 // mm를 m로 변환
+            const temp = filteredData[i].temp
+            
+            // dr 계산: 각 구간의 두께
+            let dr = 0
+            if (i === 0) {
+              // 첫 번째 점: 다음 점까지의 거리
+              if (filteredData.length > 1) {
+                dr = (filteredData[i + 1].r - filteredData[i].r) * 1e-3
+              } else {
+                dr = r * 0.1 // 기본값 (r의 10%)
+              }
+            } else if (i === filteredData.length - 1) {
+              // 마지막 점: 이전 점까지의 거리
+              dr = (filteredData[i].r - filteredData[i - 1].r) * 1e-3
+            } else {
+              // 중간 점: 양쪽 구간의 평균
+              const dr1 = (filteredData[i].r - filteredData[i - 1].r) * 1e-3
+              const dr2 = (filteredData[i + 1].r - filteredData[i].r) * 1e-3
+              dr = (dr1 + dr2) / 2
+            }
+            
+            // 가중치 = r * dr (넓이 요소의 비례)
+            const weight = r * dr
+            weightedSum += temp * weight
+            weightSum += weight
+          }
+          
+          if (weightSum > 0) {
+            perovskiteAvgTemp = weightedSum / weightSum
+          }
+        }
+      } catch (e) {
+        console.error('페로브스카이트 중간 z 온도 계산 오류:', e)
+      }
     }
     
     return {
@@ -649,8 +756,9 @@ function App() {
       tempDifferenceLateral, // Lateral (수평) 온도 차이
       maxTempLateral,
       minTempLateral,
-      bottomTemp,
-      topTemp
+      perovskiteMaxTemp, // 페로브스카이트 중간 z에서 최고온도
+      perovskiteMinTemp, // 페로브스카이트 중간 z에서 최저온도
+      perovskiteAvgTemp  // 페로브스카이트 중간 z에서 평균온도 (넓이 고려)
     }
   }
   
@@ -800,9 +908,9 @@ function App() {
       // 시뮬레이션 요약
       sheet5Data.push(['시뮬레이션 요약', ''])
       sheet5Data.push(['시작 온도 (°C)', Number(stats.startTemp)])
-      sheet5Data.push(['최종 온도 (°C)', stats.finalTemp !== null ? Number(stats.finalTemp) : 'N/A'])
-      sheet5Data.push(['하단 끝 온도 (Glass 시작점) (°C)', stats.bottomTemp !== null ? Number(stats.bottomTemp) : 'N/A'])
-      sheet5Data.push(['상단 끝 온도 (Cathode 끝) (°C)', stats.topTemp !== null ? Number(stats.topTemp) : 'N/A'])
+      sheet5Data.push(['페로브스카이트 중간 z 최고온도 (°C)', stats.perovskiteMaxTemp !== null ? Number(stats.perovskiteMaxTemp) : 'N/A'])
+      sheet5Data.push(['페로브스카이트 중간 z 최저온도 (°C)', stats.perovskiteMinTemp !== null ? Number(stats.perovskiteMinTemp) : 'N/A'])
+      sheet5Data.push(['페로브스카이트 중간 z 평균온도 (°C)', stats.perovskiteAvgTemp !== null ? Number(stats.perovskiteAvgTemp) : 'N/A'])
       sheet5Data.push(['소자 내부 최대 온도 (°C)', stats.maxTemp !== null ? Number(stats.maxTemp) : 'N/A'])
       sheet5Data.push(['소자 내부 최소 온도 (°C)', stats.minTemp !== null ? Number(stats.minTemp) : 'N/A'])
       sheet5Data.push(['소자 내부 온도 차이 (Vertical) (°C)', stats.tempDifference !== null ? Number(stats.tempDifference) : 'N/A'])
@@ -1148,13 +1256,36 @@ function App() {
               </div>
             </div>
 
-            <button 
-              className="simulate-button" 
-              onClick={handleSimulate}
-              disabled={loading}
-            >
-              {loading ? '시뮬레이션 실행 중...' : '시뮬레이션 실행'}
-            </button>
+            <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
+              <button 
+                className="simulate-button" 
+                onClick={handleSimulate}
+                disabled={loading}
+              >
+                {loading ? '시뮬레이션 실행 중...' : '시뮬레이션 실행'}
+              </button>
+              
+              {loading && sessionId && (
+                <button 
+                  onClick={handleCancel}
+                  style={{
+                    padding: '10px 20px',
+                    backgroundColor: '#ef4444',
+                    color: 'white',
+                    border: 'none',
+                    borderRadius: '8px',
+                    cursor: 'pointer',
+                    fontSize: '14px',
+                    fontWeight: '500',
+                    transition: 'background-color 0.2s'
+                  }}
+                  onMouseOver={(e) => e.target.style.backgroundColor = '#dc2626'}
+                  onMouseOut={(e) => e.target.style.backgroundColor = '#ef4444'}
+                >
+                  중단
+                </button>
+              )}
+            </div>
             
             {(loading || (progress.progress > 0 && progress.progress < 100)) && (
               <div style={{ 
@@ -2165,21 +2296,21 @@ function App() {
                       gap: '15px'
                     }}>
                       <div>
-                        <div style={{ fontSize: '0.9em', color: '#666', marginBottom: '5px' }}>하단 끝 온도 (Glass 시작점)</div>
-                        <div style={{ fontSize: '1.2em', fontWeight: 'bold', color: '#2563eb' }}>
-                          {stats.bottomTemp !== null && stats.bottomTemp !== undefined ? `${stats.bottomTemp.toFixed(2)} °C` : 'N/A'}
-                        </div>
-                      </div>
-                      <div>
-                        <div style={{ fontSize: '0.9em', color: '#666', marginBottom: '5px' }}>상단 끝 온도 ({topLayerName} 끝)</div>
+                        <div style={{ fontSize: '0.9em', color: '#666', marginBottom: '5px' }}>페로브스카이트 중간 z 최고온도</div>
                         <div style={{ fontSize: '1.2em', fontWeight: 'bold', color: '#dc2626' }}>
-                          {stats.topTemp !== null && stats.topTemp !== undefined ? `${stats.topTemp.toFixed(2)} °C` : 'N/A'}
+                          {stats.perovskiteMaxTemp !== null && stats.perovskiteMaxTemp !== undefined ? `${stats.perovskiteMaxTemp.toFixed(2)} °C` : 'N/A'}
                         </div>
                       </div>
                       <div>
-                        <div style={{ fontSize: '0.9em', color: '#666', marginBottom: '5px' }}>페로브스카이트 중간 온도</div>
+                        <div style={{ fontSize: '0.9em', color: '#666', marginBottom: '5px' }}>페로브스카이트 중간 z 최저온도</div>
+                        <div style={{ fontSize: '1.2em', fontWeight: 'bold', color: '#2563eb' }}>
+                          {stats.perovskiteMinTemp !== null && stats.perovskiteMinTemp !== undefined ? `${stats.perovskiteMinTemp.toFixed(2)} °C` : 'N/A'}
+                        </div>
+                      </div>
+                      <div>
+                        <div style={{ fontSize: '0.9em', color: '#666', marginBottom: '5px' }}>페로브스카이트 중간 z 평균온도</div>
                         <div style={{ fontSize: '1.2em', fontWeight: 'bold', color: '#16a34a' }}>
-                          {stats.finalTemp !== null && stats.finalTemp !== undefined ? `${stats.finalTemp.toFixed(2)} °C` : 'N/A'}
+                          {stats.perovskiteAvgTemp !== null && stats.perovskiteAvgTemp !== undefined ? `${stats.perovskiteAvgTemp.toFixed(2)} °C` : 'N/A'}
                         </div>
                       </div>
                       <div>

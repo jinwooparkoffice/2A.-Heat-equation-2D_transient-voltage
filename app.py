@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
-from werkzeug.exceptions import RequestEntityTooLarge
+from werkzeug.exceptions import RequestEntityTooLarge, HTTPException
 import numpy as np
 from scipy import sparse
 from scipy.integrate import solve_ivp
@@ -35,6 +35,10 @@ MAX_T_EVAL_POINTS = 100  # 최대 시간 포인트 수
         # 진행률 저장용 전역 변수 (스레드 안전)
 progress_store = {}
 progress_lock = threading.Lock()
+
+# 취소 플래그 저장용 전역 변수 (스레드 안전)
+cancel_flags = {}
+cancel_lock = threading.Lock()
 
 # ThreadPoolExecutor로 동시 실행 수 제한 (최대 3개 작업 동시 실행)
 # 프로덕션 환경에서는 Celery/RQ + Redis 권장
@@ -335,6 +339,24 @@ def handle_request_entity_too_large(e):
         'error': f'요청 크기가 너무 큽니다. 최대 크기: {app.config["MAX_CONTENT_LENGTH"] / (1024*1024):.1f}MB'
     }), 413
 
+@app.errorhandler(Exception)
+def handle_general_exception(e):
+    """모든 예외를 처리하는 전역 예외 핸들러 (HTTPException 제외)"""
+    # HTTPException은 Flask가 자동으로 처리하므로 여기서는 건너뜀
+    if isinstance(e, HTTPException):
+        return e
+    
+    error_msg = f"서버 오류가 발생했습니다: {str(e)}"
+    error_type = type(e).__name__
+    flush_print(f"❌ 전역 예외 핸들러에서 오류 포착: {error_type}: {error_msg}")
+    flush_print(traceback.format_exc())
+    
+    return jsonify({
+        'success': False,
+        'error': error_msg,
+        'error_type': error_type
+    }), 500
+
 @app.route('/')
 def health():
     return jsonify({'status': 'ok', 'message': 'Flask backend is running'})
@@ -377,6 +399,31 @@ def get_progress(session_id):
             'has_result': False,
             'has_error': True,
             'error': str(e)
+        }), 500
+
+@app.route('/api/cancel/<session_id>', methods=['POST'])
+def cancel_simulation(session_id):
+    """시뮬레이션 취소 요청"""
+    try:
+        with cancel_lock:
+            cancel_flags[session_id] = True
+            flush_print(f"🛑 시뮬레이션 취소 요청: {session_id}")
+        
+        # 진행률 업데이트
+        with progress_lock:
+            if session_id in progress_store:
+                progress_store[session_id]['message'] = '취소 중...'
+                progress_store[session_id]['cancelled'] = True
+        
+        return jsonify({
+            'success': True,
+            'message': '시뮬레이션 취소 요청이 전달되었습니다.'
+        })
+    except Exception as e:
+        flush_print(f"⚠️ 취소 요청 처리 오류: {e}")
+        return jsonify({
+            'success': False,
+            'error': f'취소 요청 처리 중 오류: {str(e)}'
         }), 500
 
 @app.route('/api/result/<session_id>', methods=['GET'])
@@ -428,46 +475,92 @@ def simulate():
     """시뮬레이션 요청을 받아 즉시 session_id를 반환하고, 실제 시뮬레이션은 별도 스레드에서 실행"""
     import uuid
     import sys
-    session_id = str(uuid.uuid4())
     
-    # 진행률 초기화 (lock으로 안전하게)
-    with progress_lock:
-        progress_store[session_id] = {'progress': 0, 'message': '초기화 중...', 'timestamp': time.time()}
-    
-    # 요청 데이터 저장 (스레드에서 사용)
-    data = request.json
-    if not data:
-        return jsonify({'success': False, 'error': '요청 데이터가 없습니다.'}), 400
-    
-    # ThreadPoolExecutor로 시뮬레이션 실행 (동시 실행 수 제한)
-    def run_simulation():
+    try:
+        session_id = str(uuid.uuid4())
+        
+        # 요청 데이터 저장 (스레드에서 사용)
+        data = None
         try:
-            _simulate_worker(session_id, data)
-        except Exception as e:
-            error_msg = f"시뮬레이션 실행 중 오류: {str(e)}"
-            flush_print(f"❌ {error_msg}")
-            flush_print(f"트레이스백:\n{traceback.format_exc()}")
+            data = request.json
+        except Exception as json_error:
+            flush_print(f"⚠️ JSON 파싱 오류: {json_error}")
+            flush_print(traceback.format_exc())
+            return jsonify({
+                'success': False, 
+                'error': f'요청 데이터를 파싱할 수 없습니다: {str(json_error)}'
+            }), 400
+        
+        if not data:
+            return jsonify({'success': False, 'error': '요청 데이터가 없습니다.'}), 400
+        
+        # 진행률 초기화 (lock으로 안전하게)
+        try:
             with progress_lock:
-                progress_store[session_id] = {
-                    'progress': 0, 
-                    'message': f'오류 발생: {str(e)}',
-                    'error': str(e),
-                    'timestamp': time.time()
-                }
-    
-    # ThreadPoolExecutor로 제출 (daemon thread 대신)
-    executor.submit(run_simulation)
-    
-    # 즉시 session_id 반환
-    return jsonify({
-        'success': True,
-        'session_id': session_id,
-        'message': '시뮬레이션이 시작되었습니다. /api/progress/<session_id>로 진행률을 확인하세요.'
-    })
+                progress_store[session_id] = {'progress': 0, 'message': '초기화 중...', 'timestamp': time.time()}
+        except Exception as lock_error:
+            flush_print(f"⚠️ 진행률 초기화 오류: {lock_error}")
+            flush_print(traceback.format_exc())
+            return jsonify({
+                'success': False,
+                'error': f'시스템 초기화 중 오류가 발생했습니다: {str(lock_error)}'
+            }), 500
+        
+        # ThreadPoolExecutor로 시뮬레이션 실행 (동시 실행 수 제한)
+        def run_simulation():
+            try:
+                _simulate_worker(session_id, data)
+            except Exception as e:
+                error_msg = f"시뮬레이션 실행 중 오류: {str(e)}"
+                flush_print(f"❌ {error_msg}")
+                flush_print(f"트레이스백:\n{traceback.format_exc()}")
+                with progress_lock:
+                    progress_store[session_id] = {
+                        'progress': 0, 
+                        'message': f'오류 발생: {str(e)}',
+                        'error': str(e),
+                        'timestamp': time.time()
+                    }
+        
+        # ThreadPoolExecutor로 제출 (daemon thread 대신)
+        try:
+            executor.submit(run_simulation)
+        except Exception as submit_error:
+            flush_print(f"⚠️ 시뮬레이션 제출 오류: {submit_error}")
+            flush_print(traceback.format_exc())
+            # 진행률 저장소에서 세션 제거
+            with progress_lock:
+                if session_id in progress_store:
+                    del progress_store[session_id]
+            return jsonify({
+                'success': False,
+                'error': f'시뮬레이션을 시작할 수 없습니다: {str(submit_error)}'
+            }), 500
+        
+        # 즉시 session_id 반환
+        return jsonify({
+            'success': True,
+            'session_id': session_id,
+            'message': '시뮬레이션이 시작되었습니다. /api/progress/<session_id>로 진행률을 확인하세요.'
+        })
+    except Exception as e:
+        error_msg = f"시뮬레이션 요청 처리 중 예상치 못한 오류: {str(e)}"
+        flush_print(f"❌ {error_msg}")
+        flush_print(traceback.format_exc())
+        return jsonify({
+            'success': False,
+            'error': error_msg,
+            'error_type': type(e).__name__
+        }), 500
 
 def _simulate_worker(session_id, data):
     """실제 시뮬레이션 작업을 수행하는 워커 함수"""
     try:
+        # 취소 플래그 확인 함수
+        def is_cancelled():
+            with cancel_lock:
+                return cancel_flags.get(session_id, False)
+        
         # 오래된 진행률 정리
         cleanup_old_progress()
         
@@ -873,6 +966,13 @@ def _simulate_worker(session_id, data):
         
         # PDE 시스템 정의 (RHS 최적화: Flat indexing 사용)
         def pde_system(t, T_flat):
+            # 취소 플래그 확인 (주기적으로 확인)
+            if is_cancelled():
+                flush_print(f"🛑 시뮬레이션 취소됨 (session_id: {session_id}, t={t:.3f} s)")
+                update_progress(0, '취소됨')
+                # 취소 예외 발생 (솔버가 중단됨)
+                raise ValueError("시뮬레이션이 취소되었습니다.")
+            
             # (1) 열 전도 항 계산 (Sparse Matrix-Vector Multiplication)
             # laplacian_csr.dot()은 내부적으로 최적화된 C/Fortran 루프를 사용합니다
             dTdt = laplacian_csr.dot(T_flat)
@@ -887,6 +987,12 @@ def _simulate_worker(session_id, data):
             # 주기적으로 진행 상황 출력 (매 5초마다, lock으로 안전하게 업데이트)
             # 단순화: progress_state_cache 제거, progress_store만 사용
             if t - last_print_time[0] >= 5.0:  # 5초마다 업데이트 (오버헤드 최소화)
+                # 취소 플래그 재확인
+                if is_cancelled():
+                    flush_print(f"🛑 시뮬레이션 취소됨 (session_id: {session_id}, t={t:.3f} s)")
+                    update_progress(0, '취소됨')
+                    raise ValueError("시뮬레이션이 취소되었습니다.")
+                
                 T_center = T_flat[0]  # r=0, z=0 (flat index)
                 message = f"진행 중... t = {t:.3f} s ({t/t_end*100:.1f}%), T[0, 0] = {T_center:.2f} K"
                 flush_print(message)
@@ -1034,6 +1140,20 @@ def _simulate_worker(session_id, data):
         
         update_progress(15, f'솔버 실행 중... (그리드: {Nr}x{Nz})')
         
+        # 솔버 실행 전 취소 플래그 확인
+        if is_cancelled():
+            flush_print(f"🛑 시뮬레이션 취소됨 (솔버 실행 전, session_id: {session_id})")
+            update_progress(0, '취소됨')
+            with progress_lock:
+                progress_store[session_id] = {
+                    'progress': 0,
+                    'message': '취소됨',
+                    'error': '시뮬레이션이 취소되었습니다.',
+                    'cancelled': True,
+                    'timestamp': time.time()
+                }
+            return
+        
         start_time = time.time()
         
         # Jacobian 사용 여부 선택 (성능 비교용)
@@ -1060,6 +1180,30 @@ def _simulate_worker(session_id, data):
                 flush_print("=== 수치 Jacobian 사용 (BDF 내부 추정) ===")
             
             sol = solve_ivp(**solver_kwargs)
+        except ValueError as cancel_error:
+            # 취소 예외 처리
+            if "취소" in str(cancel_error) or "cancel" in str(cancel_error).lower():
+                flush_print(f"🛑 시뮬레이션 취소됨 (session_id: {session_id})")
+                with progress_lock:
+                    progress_store[session_id] = {
+                        'progress': 0,
+                        'message': '취소됨',
+                        'error': '시뮬레이션이 취소되었습니다.',
+                        'cancelled': True,
+                        'timestamp': time.time()
+                    }
+                # 취소 플래그 정리
+                with cancel_lock:
+                    if session_id in cancel_flags:
+                        del cancel_flags[session_id]
+                return  # 정상 종료 (예외 발생시키지 않음)
+            else:
+                # 다른 ValueError는 그대로 전파
+                error_msg = f"솔버 실행 중 오류: {str(cancel_error)}"
+                flush_print(f"❌ {error_msg}")
+                flush_print(f"트레이스백:\n{traceback.format_exc()}")
+                update_progress(0, f'솔버 오류: {str(cancel_error)}')
+                raise ValueError(error_msg) from cancel_error
         except Exception as solver_error:
             error_msg = f"솔버 실행 중 오류: {str(solver_error)}"
             flush_print(f"❌ {error_msg}")
@@ -1421,6 +1565,11 @@ def _simulate_worker(session_id, data):
                 'error_details': error_info,
                 'timestamp': time.time()
             }
+        
+        # 취소 플래그 정리 (에러 발생 시에도 정리)
+        with cancel_lock:
+            if session_id in cancel_flags:
+                del cancel_flags[session_id]
 
 if __name__ == '__main__':
     import sys
