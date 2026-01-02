@@ -361,7 +361,8 @@ def handle_general_exception(e):
 def health():
     return jsonify({'status': 'ok', 'message': 'Flask backend is running'})
 
-@app.route('/api/check-password', methods=['POST'])
+@app.route('/check-password', methods=['POST'])
+@app.route('/api/check-password', methods=['POST'])  # Fly.io 호환성
 def check_password():
     """비밀번호 확인 엔드포인트
     Vercel 환경에서만 동작 (환경 변수 PASSWORD가 설정된 경우)
