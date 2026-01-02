@@ -361,6 +361,55 @@ def handle_general_exception(e):
 def health():
     return jsonify({'status': 'ok', 'message': 'Flask backend is running'})
 
+@app.route('/api/check-password', methods=['POST'])
+def check_password():
+    """비밀번호 확인 엔드포인트
+    Vercel 환경에서만 동작 (환경 변수 PASSWORD가 설정된 경우)
+    localhost에서는 항상 성공"""
+    try:
+        # localhost 체크 (개발 환경에서는 비밀번호 체크 스킵)
+        is_localhost = request.host.startswith('localhost') or request.host.startswith('127.0.0.1')
+        
+        # 환경 변수에서 비밀번호 읽기
+        expected_password = os.environ.get('PASSWORD')
+        
+        # localhost이거나 비밀번호가 설정되지 않은 경우 항상 성공
+        if is_localhost or not expected_password:
+            return jsonify({
+                'success': True,
+                'message': '비밀번호 확인 완료'
+            })
+        
+        # 요청에서 비밀번호 읽기
+        data = request.json
+        if not data or 'password' not in data:
+            return jsonify({
+                'success': False,
+                'error': '비밀번호가 제공되지 않았습니다.'
+            }), 400
+        
+        provided_password = data.get('password', '')
+        
+        # 비밀번호 확인
+        if provided_password == expected_password:
+            return jsonify({
+                'success': True,
+                'message': '비밀번호 확인 완료'
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'error': '비밀번호가 일치하지 않습니다.'
+            }), 401
+            
+    except Exception as e:
+        flush_print(f"⚠️ 비밀번호 확인 오류: {e}")
+        flush_print(traceback.format_exc())
+        return jsonify({
+            'success': False,
+            'error': f'비밀번호 확인 중 오류 발생: {str(e)}'
+        }), 500
+
 @app.route('/api/progress/<session_id>', methods=['GET'])
 def get_progress(session_id):
     """시뮬레이션 진행률 조회
@@ -680,7 +729,83 @@ def _simulate_worker(session_id, data):
         # 향후 동적 조정 시를 대비한 검증
         if n_time_points > MAX_T_EVAL_POINTS:
             raise ValueError(f"시간 포인트 수는 {MAX_T_EVAL_POINTS}개 이하여야 합니다. 현재 값: {n_time_points}")
-        t_eval = np.logspace(np.log10(t_start + 1e-6), np.log10(t_end), n_time_points)
+        
+        # t_eval 생성: t_span 범위 내에 있도록 보장 (모든 시간 범위에서 안정적으로 작동)
+        # solve_ivp 요구사항: t_eval의 모든 값이 t_span [t_start, t_end] 범위 내에 있어야 함
+        
+        # 전략: 로그 스케일을 사용하되, 항상 안전하게 처리
+        # 1. t_start가 0이거나 매우 작으면 균등 간격 사용
+        # 2. 그 외에는 로그 스케일 사용하되, 항상 범위 내에 있도록 보장
+        
+        if t_start <= 0 or t_start < 1e-9:
+            # t_start가 0이거나 매우 작은 경우: 균등 간격 사용
+            t_eval = np.linspace(t_start, t_end, n_time_points)
+        else:
+            # 로그 스케일 사용
+            try:
+                log_start = np.log10(t_start)
+                log_end = np.log10(t_end)
+                
+                # 로그 스케일로 생성
+                t_eval = np.logspace(log_start, log_end, n_time_points)
+                
+                # 첫 번째와 마지막 값을 정확히 t_start, t_end로 설정
+                t_eval[0] = t_start
+                t_eval[-1] = t_end
+                
+                # 모든 값을 범위 내로 클리핑 (안전장치)
+                t_eval = np.clip(t_eval, t_start, t_end)
+                
+                # 정렬 (단조 증가 보장)
+                t_eval = np.sort(t_eval)
+                
+                # 중복 제거 후 부족한 포인트 보완
+                t_eval = np.unique(t_eval)
+                if len(t_eval) < n_time_points:
+                    # 부족한 포인트를 균등 간격으로 보간
+                    t_eval = np.linspace(t_start, t_end, n_time_points)
+                
+            except (ValueError, OverflowError) as e:
+                # 로그 계산 실패 시 균등 간격 사용
+                flush_print(f"⚠️ 로그 스케일 계산 실패: {e}, 균등 간격으로 대체")
+                t_eval = np.linspace(t_start, t_end, n_time_points)
+        
+        # 최종 검증 및 보정: t_eval이 정확히 [t_start, t_end] 범위 내에 있는지 확인
+        min_t_eval = np.min(t_eval)
+        max_t_eval = np.max(t_eval)
+        
+        # 부동소수점 오차를 고려한 허용 오차 (매우 작은 값)
+        tolerance = max(1e-15, abs(t_end - t_start) * 1e-12)
+        
+        # 범위 검증
+        if min_t_eval < t_start - tolerance:
+            flush_print(f"⚠️ t_eval 최소값이 t_start보다 작음: min={min_t_eval:.6e}, t_start={t_start:.6e}")
+            t_eval = np.clip(t_eval, t_start, t_end)
+            t_eval = np.sort(t_eval)
+        
+        if max_t_eval > t_end + tolerance:
+            flush_print(f"⚠️ t_eval 최대값이 t_end보다 큼: max={max_t_eval:.6e}, t_end={t_end:.6e}")
+            t_eval = np.clip(t_eval, t_start, t_end)
+            t_eval = np.sort(t_eval)
+        
+        # 최종 안전장치: 모든 값을 정확히 범위 내로 클리핑
+        t_eval = np.clip(t_eval, t_start, t_end)
+        
+        # 정렬 및 중복 제거
+        t_eval = np.sort(np.unique(t_eval))
+        
+        # 정확히 n_time_points개로 조정
+        if len(t_eval) != n_time_points:
+            # 포인트 수가 맞지 않으면 균등 간격으로 재생성
+            t_eval = np.linspace(t_start, t_end, n_time_points)
+        
+        # 최종 검증: solve_ivp 요구사항 확인
+        assert len(t_eval) == n_time_points, f"t_eval 길이 오류: {len(t_eval)} != {n_time_points}"
+        assert np.all(t_eval >= t_start), f"t_eval에 t_start보다 작은 값이 있음: min={np.min(t_eval):.6e}, t_start={t_start:.6e}"
+        assert np.all(t_eval <= t_end), f"t_eval에 t_end보다 큰 값이 있음: max={np.max(t_eval):.6e}, t_end={t_end:.6e}"
+        assert np.all(np.diff(t_eval) >= 0), "t_eval이 단조 증가하지 않음"
+        
+        flush_print(f"✅ t_eval 생성 완료: {len(t_eval)}개 포인트, 범위=[{np.min(t_eval):.6e}, {np.max(t_eval):.6e}], t_span=[{t_start:.6e}, {t_end:.6e}]")
         
         # 2D 원통좌표계 그리드 설정
         # r 방향: 0부터 R_max까지 (소자 반지름보다 크게 설정)
@@ -1255,10 +1380,45 @@ def _simulate_worker(session_id, data):
         glass_ito_boundary_nm = z_nm[glass_ito_boundary_idx]
         active_start_idx = glass_ito_boundary_idx + 1
         
-        # 활성층 위치 (ITO 시작점을 z=0으로)
+        # Cathode 레이어의 끝 인덱스 찾기 (ITO부터 Cathode까지만 표시)
+        active_end_idx = len(z_nm) - 1  # 기본값: 전체 길이
+        cathode_layer_index = None
+        try:
+            for i, name in enumerate(layer_names):
+                if name.lower() == 'cathode':
+                    cathode_layer_index = i
+                    break
+            
+            if cathode_layer_index is not None and cathode_layer_index < len(layer_indices_map):
+                # Cathode 레이어의 끝 인덱스 (포함)
+                cathode_slice = layer_indices_map[cathode_layer_index]
+                active_end_idx = cathode_slice.stop - 1  # Cathode 레이어의 마지막 인덱스
+                flush_print(f"Cathode 레이어 발견: 인덱스 {cathode_layer_index}, 끝 인덱스 {active_end_idx}")
+            else:
+                # Cathode가 없으면 마지막 레이어까지 포함
+                if len(layer_indices_map) > 0:
+                    last_layer_slice = layer_indices_map[-1]
+                    active_end_idx = last_layer_slice.stop - 1
+                    flush_print(f"Cathode 레이어를 찾을 수 없음. 마지막 레이어 끝까지 사용: 인덱스 {active_end_idx}")
+        except Exception as e:
+            flush_print(f"⚠️ Cathode 레이어 찾기 오류: {e}, 전체 범위 사용")
+            active_end_idx = len(z_nm) - 1
+        
+        # 활성층 범위 검증
+        if active_end_idx < active_start_idx:
+            flush_print(f"⚠️ active_end_idx({active_end_idx}) < active_start_idx({active_start_idx}), 전체 범위 사용")
+            active_end_idx = len(z_nm) - 1
+        
+        if active_end_idx >= len(z_nm):
+            active_end_idx = len(z_nm) - 1
+        
+        # 활성층 위치 (ITO 시작점을 z=0으로, Cathode 끝까지만)
         if active_start_idx >= len(z_nm):
             active_start_idx = len(z_nm) - 1
-        position_active_nm = (z_nm[active_start_idx:] - glass_ito_boundary_nm).tolist()
+        
+        # ITO부터 Cathode 끝까지만 포함
+        position_active_nm = (z_nm[active_start_idx:active_end_idx+1] - glass_ito_boundary_nm).tolist()
+        flush_print(f"활성층 범위: ITO 시작 인덱스 {active_start_idx}, Cathode 끝 인덱스 {active_end_idx}, 총 {len(position_active_nm)}개 포인트")
         
         # 2D 온도 데이터 (최종 시간) - 안전성 체크
         final_time_idx = -1
@@ -1268,8 +1428,12 @@ def _simulate_worker(session_id, data):
         if active_start_idx >= T_result.shape[1]:
             active_start_idx = T_result.shape[1] - 1
         
+        if active_end_idx >= T_result.shape[1]:
+            active_end_idx = T_result.shape[1] - 1
+        
         # temperature_2d 다운샘플링 (메모리 절약: 최대 200x200)
-        T_2d_raw = T_result[:, active_start_idx:, final_time_idx]  # (Nr, Nz_active)
+        # ITO부터 Cathode 끝까지만 포함
+        T_2d_raw = T_result[:, active_start_idx:active_end_idx+1, final_time_idx]  # (Nr, Nz_active)
         max_r_points = 200
         max_z_points = 200
         
@@ -1290,13 +1454,26 @@ def _simulate_worker(session_id, data):
             position_active_nm_downsampled = position_active_nm
         
         # 활성층 레이어 경계 (temperature_center 샘플링에 필요)
+        # ITO부터 Cathode까지만 포함 (Resin, Heat sink 제외)
         active_layer_boundaries_nm = [0.0]
         try:
+            # Cathode 레이어 인덱스 찾기
+            cathode_idx_for_boundaries = None
+            for i, name in enumerate(layer_names):
+                if name.lower() == 'cathode':
+                    cathode_idx_for_boundaries = i
+                    break
+            
+            # ITO(인덱스 1)부터 Cathode까지의 레이어만 포함
             max_idx = min(len(layer_names), len(thickness_layers_nm_original))
-            for i in range(1, max_idx):
+            end_idx = cathode_idx_for_boundaries + 1 if cathode_idx_for_boundaries is not None else max_idx
+            
+            for i in range(1, min(end_idx, max_idx)):
                 if i >= len(thickness_layers_nm_original):
                     raise IndexError(f"인덱스 오류: i={i}")
                 active_layer_boundaries_nm.append(float(active_layer_boundaries_nm[-1] + thickness_layers_nm_original[i]))
+            
+            flush_print(f"활성층 레이어 경계 계산: ITO부터 Cathode까지 {len(active_layer_boundaries_nm)-1}개 레이어")
         except (IndexError, ValueError) as e:
             raise ValueError(f"레이어 경계 계산 오류: {str(e)}") from e
         
@@ -1306,7 +1483,8 @@ def _simulate_worker(session_id, data):
         if T_result.shape[0] > 0:
             # z 방향: 레이어 경계와 중심 지점만 샘플링
             # 시간 방향: 로그 스케일로 샘플링 (초기에는 촘촘, 후반에는 성글게)
-            n_z_samples = min(50, T_result.shape[1] - active_start_idx)  # 최대 50개 z 위치
+            # ITO부터 Cathode 끝까지만 샘플링
+            n_z_samples = min(50, active_end_idx + 1 - active_start_idx)  # 최대 50개 z 위치
             n_time_samples = min(30, T_result.shape[2])  # 최대 30개 시간 포인트
             
             # z 방향 샘플링: 레이어 경계와 중심 포함
@@ -1331,7 +1509,8 @@ def _simulate_worker(session_id, data):
                 z_indices_sampled = sorted(set(z_indices_sampled))
                 remaining = n_z_samples - len(z_indices_sampled)
                 if remaining > 0:
-                    all_indices = set(range(T_result.shape[1] - active_start_idx))
+                    # ITO부터 Cathode 끝까지만 샘플링
+                    all_indices = set(range(active_end_idx + 1 - active_start_idx))
                     available = sorted(all_indices - set(z_indices_sampled))
                     step = max(1, len(available) // remaining)
                     z_indices_sampled.extend(available[::step])
@@ -1345,11 +1524,12 @@ def _simulate_worker(session_id, data):
             else:
                 time_indices_sampled = list(range(T_result.shape[2]))
             
-            # 샘플링된 데이터만 전달
+            # 샘플링된 데이터만 전달 (ITO부터 Cathode 끝까지만)
             temperature_center_sampled = []
             for z_idx in z_indices_sampled:
                 z_idx_actual = active_start_idx + z_idx
-                if z_idx_actual < T_result.shape[1]:
+                # active_end_idx를 넘지 않도록 검증
+                if z_idx_actual < T_result.shape[1] and z_idx_actual <= active_end_idx and z_idx < len(position_active_nm):
                     temp_profile = T_result[0, z_idx_actual, :][time_indices_sampled].tolist()
                     temperature_center_sampled.append({
                         'z_index': int(z_idx),
@@ -1395,21 +1575,23 @@ def _simulate_worker(session_id, data):
             print(f"perovskite_layer_index invalid, using mid_z_idx: {perovskite_mid_idx}")
         
         # 세 가지 프로파일 계산
-        # 1. r=0에서 z에 따른 최종온도 프로파일
+        # 1. r=0에서 z에 따른 최종온도 프로파일 (ITO부터 Cathode 끝까지만)
         final_time_idx = -1
-        temp_profile_r0_z = T_result[0, :, final_time_idx].tolist()  # r=0 (인덱스 0), 모든 z, 최종 시간
-        z_profile_nm = z_nm.tolist()  # 전체 z 좌표 (nm)
+        temp_profile_r0_z = T_result[0, active_start_idx:active_end_idx+1, final_time_idx].tolist()  # r=0 (인덱스 0), ITO~Cathode, 최종 시간
+        z_profile_nm = z_nm[active_start_idx:active_end_idx+1].tolist()  # ITO~Cathode z 좌표 (nm)
         
         # r=0에서 z, time에 따른 전체 온도 데이터 (Sheet1용)
         # 메모리 절약: 다운샘플링 (최대 500개 z 포인트, 모든 시간 포인트)
+        # ITO부터 Cathode 끝까지만 포함
         temp_profile_r0_z_time = None
-        if T_result.shape[1] > 500:
+        active_z_count = active_end_idx + 1 - active_start_idx
+        if active_z_count > 500:
             # z 방향 다운샘플링
-            z_indices = np.linspace(0, T_result.shape[1] - 1, 500, dtype=int)
+            z_indices = np.linspace(active_start_idx, active_end_idx, 500, dtype=int)
             temp_profile_r0_z_time = T_result[0, z_indices, :].tolist()  # (500, n_time)
-            z_profile_nm_sampled = [float(z_profile_nm[i]) for i in z_indices]  # 리스트로 변환
+            z_profile_nm_sampled = [float(z_nm[i]) for i in z_indices]  # 리스트로 변환
         else:
-            temp_profile_r0_z_time = T_result[0, :, :].tolist()  # (Nz, n_time)
+            temp_profile_r0_z_time = T_result[0, active_start_idx:active_end_idx+1, :].tolist()  # (Nz_active, n_time)
             z_profile_nm_sampled = [float(z) for z in z_profile_nm]  # 리스트로 변환
         
         flush_print(f"=== 프로파일 1: r=0에서 z에 따른 최종온도 ===")
@@ -1473,7 +1655,7 @@ def _simulate_worker(session_id, data):
                 'r_mm': np.array(r_mm_downsampled),  # 다운샘플링된 r 좌표
                 'perovskite_center_temp': np.array(perovskite_center_temp),
                 'layer_boundaries_nm': np.array(active_layer_boundaries_nm),
-                'layer_names': layer_names[1:] if len(layer_names) > 1 else [],
+                'layer_names': layer_names[1:cathode_layer_index+1] if cathode_layer_index is not None and len(layer_names) > 1 else (layer_names[1:] if len(layer_names) > 1 else []),
                 'glass_ito_boundary_nm': glass_ito_boundary_nm,
                 'device_radius_mm': device_radius_m * 1e3,
                 'temp_profile_r0_z': np.array(temp_profile_r0_z),
@@ -1498,7 +1680,7 @@ def _simulate_worker(session_id, data):
                 'r_mm': convert_to_python_type(r_mm_downsampled),
                 'perovskite_center_temp': convert_to_python_type(perovskite_center_temp),
                 'layer_boundaries_nm': convert_to_python_type(active_layer_boundaries_nm),
-                'layer_names': layer_names[1:] if len(layer_names) > 1 else [],
+                'layer_names': layer_names[1:cathode_layer_index+1] if cathode_layer_index is not None and len(layer_names) > 1 else (layer_names[1:] if len(layer_names) > 1 else []),
                 'glass_ito_boundary_nm': float(glass_ito_boundary_nm),
                 'device_radius_mm': float(device_radius_m * 1e3),
                 'temp_profile_r0_z': convert_to_python_type(temp_profile_r0_z),

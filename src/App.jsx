@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react'
+import React, { useState, useRef, useEffect } from 'react'
 import './App.css'
 import { 
   LineChart, 
@@ -53,6 +53,12 @@ function App() {
   const [sessionId, setSessionId] = useState(null)
   const chart1Ref = useRef(null)
   const chart2Ref = useRef(null)
+  
+  // 비밀번호 확인 상태
+  const [isPasswordVerified, setIsPasswordVerified] = useState(false)
+  const [password, setPassword] = useState('')
+  const [passwordError, setPasswordError] = useState('')
+  const [isCheckingPassword, setIsCheckingPassword] = useState(true)
 
   // 두께 단위 변환 함수들
   const convertToNm = (value, unit) => {
@@ -129,6 +135,71 @@ function App() {
   // 섭씨 <-> 켈빈 변환 함수
   const celsiusToKelvin = (celsius) => celsius + 273.15
   const kelvinToCelsius = (kelvin) => kelvin - 273.15
+
+  // localhost 체크 함수
+  const isLocalhost = () => {
+    return window.location.hostname === 'localhost' || 
+           window.location.hostname === '127.0.0.1' ||
+           window.location.hostname === ''
+  }
+
+  // 비밀번호 확인 함수
+  const handlePasswordSubmit = async (e) => {
+    e.preventDefault()
+    setPasswordError('')
+    setIsCheckingPassword(true)
+
+    try {
+      const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 
+                           (import.meta.env.DEV ? '' : 'https://jouleheatingsimulation-2d.fly.dev')
+      const apiUrl = `${API_BASE_URL}/api/check-password`
+
+      const response = await fetch(apiUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ password }),
+      })
+
+      const data = await response.json()
+
+      if (data.success) {
+        // sessionStorage에 비밀번호 확인 상태 저장
+        sessionStorage.setItem('password_verified', 'true')
+        setIsPasswordVerified(true)
+        setPasswordError('')
+      } else {
+        setPasswordError(data.error || '비밀번호가 일치하지 않습니다.')
+      }
+    } catch (error) {
+      setPasswordError('비밀번호 확인 중 오류가 발생했습니다.')
+      console.error('비밀번호 확인 오류:', error)
+    } finally {
+      setIsCheckingPassword(false)
+    }
+  }
+
+  // 컴포넌트 마운트 시 비밀번호 확인 상태 체크
+  useEffect(() => {
+    const checkPasswordStatus = async () => {
+      // localhost에서는 항상 통과
+      if (isLocalhost()) {
+        setIsPasswordVerified(true)
+        setIsCheckingPassword(false)
+        return
+      }
+
+      // sessionStorage에서 확인 상태 읽기
+      const verified = sessionStorage.getItem('password_verified')
+      if (verified === 'true') {
+        setIsPasswordVerified(true)
+      }
+      setIsCheckingPassword(false)
+    }
+
+    checkPasswordStatus()
+  }, [])
 
   const handleSimulate = async () => {
     setLoading(true)
@@ -996,6 +1067,84 @@ function App() {
       console.error('Excel 저장 중 오류:', error)
       alert('Excel 저장 중 오류가 발생했습니다: ' + error.message)
     }
+  }
+
+  // 비밀번호 확인 중이거나 비밀번호가 확인되지 않은 경우
+  if (isCheckingPassword) {
+    return (
+      <div className="app">
+        <div className="container" style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '100vh' }}>
+          <div style={{ textAlign: 'center' }}>
+            <h2>로딩 중...</h2>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  if (!isPasswordVerified) {
+    return (
+      <div className="app">
+        <div className="container" style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '100vh' }}>
+          <div style={{ 
+            maxWidth: '400px', 
+            width: '100%', 
+            padding: '40px', 
+            backgroundColor: '#fff', 
+            borderRadius: '8px', 
+            boxShadow: '0 2px 10px rgba(0,0,0,0.1)',
+            textAlign: 'center'
+          }}>
+            <h2 style={{ marginBottom: '20px' }}>비밀번호 입력</h2>
+            <form onSubmit={handlePasswordSubmit}>
+              <div style={{ marginBottom: '20px' }}>
+                <input
+                  type="password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder="비밀번호를 입력하세요"
+                  style={{
+                    width: '100%',
+                    padding: '12px',
+                    fontSize: '16px',
+                    border: '1px solid #ddd',
+                    borderRadius: '4px',
+                    boxSizing: 'border-box'
+                  }}
+                  autoFocus
+                />
+              </div>
+              {passwordError && (
+                <div style={{ 
+                  color: '#d32f2f', 
+                  marginBottom: '20px',
+                  fontSize: '14px'
+                }}>
+                  {passwordError}
+                </div>
+              )}
+              <button
+                type="submit"
+                disabled={isCheckingPassword}
+                style={{
+                  width: '100%',
+                  padding: '12px',
+                  fontSize: '16px',
+                  backgroundColor: '#1976d2',
+                  color: '#fff',
+                  border: 'none',
+                  borderRadius: '4px',
+                  cursor: isCheckingPassword ? 'not-allowed' : 'pointer',
+                  opacity: isCheckingPassword ? 0.6 : 1
+                }}
+              >
+                {isCheckingPassword ? '확인 중...' : '확인'}
+              </button>
+            </form>
+          </div>
+        </div>
+      </div>
+    )
   }
 
   return (
