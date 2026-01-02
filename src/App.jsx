@@ -1085,19 +1085,42 @@ function App() {
   if (!isPasswordVerified) {
     return (
       <div className="app">
-        <div className="container" style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '100vh' }}>
+        <div className="container" style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '100vh', padding: '20px' }}>
           <div style={{ 
-            maxWidth: '400px', 
+            maxWidth: '800px', 
             width: '100%', 
-            padding: '40px', 
+            padding: '60px', 
             backgroundColor: '#fff', 
             borderRadius: '8px', 
-            boxShadow: '0 2px 10px rgba(0,0,0,0.1)',
-            textAlign: 'center'
+            boxShadow: '0 2px 10px rgba(0,0,0,0.1)'
           }}>
-            <h2 style={{ marginBottom: '20px' }}>비밀번호 입력</h2>
+            {/* Title Section */}
+            <div className="title-section" style={{ marginBottom: '40px' }}>
+              <div className="title-content">
+                <h1>Joule Heating Simulation (2D Cylindrical)</h1>
+                <p className="subtitle">Heat dissipation in PeLED operation using 2D cylindrical coordinate heat equation</p>
+              </div>
+              <img
+                src="/PNEL_logo.png"
+                alt="PNEL Logo"
+                className="title-logo"
+                onError={() => setLogoError(true)}
+                style={{ display: logoError ? 'none' : 'block' }}
+              />
+            </div>
+
+            {/* Password Form */}
             <form onSubmit={handlePasswordSubmit}>
-              <div style={{ marginBottom: '20px' }}>
+              <div style={{ marginBottom: '24px' }}>
+                <label style={{ 
+                  display: 'block', 
+                  marginBottom: '8px', 
+                  fontSize: '16px', 
+                  fontWeight: '500',
+                  color: '#333'
+                }}>
+                  비밀번호
+                </label>
                 <input
                   type="password"
                   value={password}
@@ -1135,11 +1158,20 @@ function App() {
                   border: 'none',
                   borderRadius: '4px',
                   cursor: isCheckingPassword ? 'not-allowed' : 'pointer',
-                  opacity: isCheckingPassword ? 0.6 : 1
+                  opacity: isCheckingPassword ? 0.6 : 1,
+                  marginBottom: '16px'
                 }}
               >
-                {isCheckingPassword ? '확인 중...' : '확인'}
+                {isCheckingPassword ? '확인 중...' : '로그인'}
               </button>
+              <p style={{ 
+                fontSize: '14px', 
+                color: '#666', 
+                textAlign: 'center', 
+                margin: 0 
+              }}>
+                브라우저 탭을 닫으면 세션이 만료됩니다.
+              </p>
             </form>
           </div>
         </div>
