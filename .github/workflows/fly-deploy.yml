@@ -1,13 +1,13 @@
 name: Fly Deploy
 
+# Fly.io 배포 비활성화 (Vercel만 사용)
+# on:
+#   push:
+#     branches:
+#       - main
+#   workflow_dispatch:
 on:
-  push:
-    branches:
-      - main
-  workflow_dispatch:
-
-env:
-  FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+  workflow_dispatch:  # 수동 실행만 가능
 
 jobs:
   deploy:
@@ -19,9 +19,23 @@ jobs:
       
       - uses: superfly/flyctl-actions/setup-flyctl@master
       
-      - run: flyctl deploy --remote-only
+      - name: Check Fly.io authentication
+        run: |
+          if [ -z "${{ secrets.FLY_API_TOKEN }}" ]; then
+            echo "❌ FLY_API_TOKEN이 설정되지 않았습니다!"
+            exit 1
+          fi
+          echo "✅ FLY_API_TOKEN이 설정되어 있습니다"
+      
+      - name: Verify Fly.io app exists
+        run: |
+          flyctl apps list || echo "⚠️ 앱 목록 확인 실패"
+      
+      - name: Deploy to Fly.io
+        run: flyctl deploy --remote-only
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        continue-on-error: false
 
 
 

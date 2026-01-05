@@ -1130,9 +1130,11 @@ function App() {
                     width: '100%',
                     padding: '12px',
                     fontSize: '16px',
-                    border: '1px solid #ddd',
+                    border: '1px solid #000',
                     borderRadius: '4px',
-                    boxSizing: 'border-box'
+                    boxSizing: 'border-box',
+                    backgroundColor: '#fff',
+                    color: '#000'
                   }}
                   autoFocus
                 />
@@ -1153,13 +1155,24 @@ function App() {
                   width: '100%',
                   padding: '12px',
                   fontSize: '16px',
-                  backgroundColor: '#1976d2',
+                  backgroundColor: '#333',
                   color: '#fff',
-                  border: 'none',
+                  border: '1px solid #000',
                   borderRadius: '4px',
                   cursor: isCheckingPassword ? 'not-allowed' : 'pointer',
                   opacity: isCheckingPassword ? 0.6 : 1,
-                  marginBottom: '16px'
+                  marginBottom: '16px',
+                  transition: 'background-color 0.2s ease'
+                }}
+                onMouseEnter={(e) => {
+                  if (!isCheckingPassword) {
+                    e.target.style.backgroundColor = '#555'
+                  }
+                }}
+                onMouseLeave={(e) => {
+                  if (!isCheckingPassword) {
+                    e.target.style.backgroundColor = '#333'
+                  }
                 }}
               >
                 {isCheckingPassword ? '확인 중...' : '로그인'}
