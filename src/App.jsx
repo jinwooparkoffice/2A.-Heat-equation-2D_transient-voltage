@@ -27,11 +27,19 @@ const DEFAULT_VALUES = {
   rho_layers: [2500, 7140, 1000, 4100, 1200, 2700, 1100, 2330],
   c_p_layers: [1000, 280, 1500, 250, 1500, 900, 1800, 700],
   // 기본값: Glass=1.1mm, Resin=3μm, Heat sink=1mm, 나머지=nm
-  thickness_layers_nm: [1100000, 70, 80, 280, 50, 100, 3000, 1000000], // Resin=3μm, Heat sink=1mm
+  thickness_layers_nm: [1100000, 70, 80, 200, 50, 100, 3000, 1000000], // Resin=3μm, Heat sink=1mm
   layer_enabled: [true, true, true, true, true, true, false, false], // Resin과 Heat sink는 기본적으로 비활성화
   voltage: 2.9,
   current_density: 30.0, // 단위: mA/cm² (기존 300.0 A/m² = 30.0 mA/cm²)
   eqe: 0.2, // External Quantum Efficiency (20%)
+  // 열원 모델
+  // - legacy_perov_eqe: 기존(Perovskite에만 V*J*(1-EQE) 적용)
+  // - split_vphoton_sigma: Vphoton(=hc/qλ) 기반 분해 + (V-Vphoton)*J를 레이어 저항(t/σ)로 분배
+  heat_source_model: 'split_vphoton_sigma',
+  emission_wavelength_nm: 540.0, // 발광 피크 파장 (nm) - CsPbBr3 기준
+  // 레이어별 전기전도도 σ (S/m) - 열원 분배에 사용(전기 경로 레이어만 의미 있음)
+  // Glass: 절연체, ITO: 투명전극, HTL(PEDOT:PSS AI4083): 유기전도성, Perovskite(CsPbBr3): 반도체, ETL(POT2T): 유기물, Cathode(Al): 금속
+  sigma_elec_layers: [0, 10000, 1000, 5, 0.01, 35000000, 0, 0], // [Glass, ITO, PEDOT:PSS AI4083, CsPbBr3, POT2T, Al, Resin, Heat sink]
   epsilon_top: 0.05,
   epsilon_bottom: 0.85,
   epsilon_side: 0.05, // 측면 방사율
@@ -97,7 +105,12 @@ function App() {
   }
 
   const handleGlobalChange = (field, value) => {
-    setFormData({ ...formData, [field]: parseFloat(value) || 0 })
+    // 문자열/선택형 파라미터는 별도 처리
+    if (field === 'heat_source_model') {
+      setFormData({ ...formData, [field]: value })
+    } else {
+      setFormData({ ...formData, [field]: parseFloat(value) || 0 })
+    }
     // 입력값이 변경되면 이전 시뮬레이션 결과 초기화
     if (simulationResult) {
       setSimulationResult(null)
@@ -219,6 +232,7 @@ function App() {
       const filteredRho = enabledIndices.map(idx => formData.rho_layers[idx])
       const filteredCp = enabledIndices.map(idx => formData.c_p_layers[idx])
       const filteredThickness = enabledIndices.map(idx => formData.thickness_layers_nm[idx])
+      const filteredSigmaElec = enabledIndices.map(idx => formData.sigma_elec_layers?.[idx] ?? 0)
       
       // 섭씨를 켈빈으로 변환하여 백엔드에 전송
       const dataToSend = {
@@ -228,6 +242,7 @@ function App() {
         rho_layers: filteredRho,
         c_p_layers: filteredCp,
         thickness_layers_nm: filteredThickness,
+        sigma_elec_layers: filteredSigmaElec,
         layer_enabled: formData.layer_enabled,
         T_ambient: celsiusToKelvin(formData.T_ambient),
         device_area_mm2: formData.device_area_mm2,
@@ -1297,6 +1312,17 @@ function App() {
                             disabled={showCheckbox && !formData.layer_enabled[index]}
                           />
                         </div>
+                        <div className="input-field">
+                          <label>전기전도도 σ (S/m)</label>
+                          <input
+                            type="number"
+                            value={formData.sigma_elec_layers?.[index] ?? 0}
+                            onChange={(e) => handleLayerChange(index, 'sigma_elec_layers', e.target.value)}
+                            step="any"
+                            min="0"
+                            disabled={showCheckbox && !formData.layer_enabled[index]}
+                          />
+                        </div>
                       </div>
                     </div>
                   )
@@ -1308,6 +1334,16 @@ function App() {
             <div className="parameters-section">
               <h3>전기적 파라미터</h3>
               <div className="parameters-grid">
+                <div className="input-field">
+                  <label>열원 모델</label>
+                  <select
+                    value={formData.heat_source_model}
+                    onChange={(e) => handleGlobalChange('heat_source_model', e.target.value)}
+                  >
+                    <option value="split_vphoton_sigma">Vphoton(λ) 분해 + (V−Vph)·J 저항분배</option>
+                    <option value="legacy_perov_eqe">기존: Perovskite에만 V·J·(1−EQE)</option>
+                  </select>
+                </div>
                 <div className="input-field">
                   <label>전압 (V)</label>
                   <input
@@ -1336,6 +1372,20 @@ function App() {
                     min="0"
                     max="1"
                   />
+                </div>
+                <div className="input-field">
+                  <label>발광 파장 λ (nm)</label>
+                  <input
+                    type="number"
+                    value={formData.emission_wavelength_nm}
+                    onChange={(e) => handleGlobalChange('emission_wavelength_nm', e.target.value)}
+                    step="1"
+                    min="200"
+                    max="1200"
+                  />
+                  <small style={{ color: '#666', fontSize: '0.85em' }}>
+                    Vphoton = hc/(qλ)로 환산되어 광출력/재결합열 분해에 사용됩니다.
+                  </small>
                 </div>
                 <div className="input-field">
                   <label>소자 크기 (mm²)</label>
