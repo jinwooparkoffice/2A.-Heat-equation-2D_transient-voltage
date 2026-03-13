@@ -23,31 +23,25 @@ const DEFAULT_VALUES = {
   layer_names: LAYER_NAMES,
   // Resin: UV curable resin (polymer) - k=20, ρ=1100, cp=1800
   // Heat sink: Silicon - k=150, ρ=2330, cp=700
-  k_therm_layers: [0.8, 10.0, 0.2, 0.5, 0.2, 200.0, 20.0, 150.0],
-  rho_layers: [2500, 7140, 1000, 4100, 1200, 2700, 1100, 2330],
-  c_p_layers: [1000, 280, 1500, 250, 1500, 900, 1800, 700],
+  k_therm_layers: [0.8, 10.0, 0.2, 0.2, 0.2, 200.0, 20.0, 150.0],
+  rho_layers: [1600, 7140, 1200, 1200, 1200, 2700, 1100, 2330],
+  c_p_layers: [800, 280, 1500, 1500, 1500, 900, 1800, 700],
   // 기본값: Glass=1.1mm, Resin=3μm, Heat sink=1mm, 나머지=nm
-  thickness_layers_nm: [1100000, 70, 80, 200, 50, 100, 3000, 1000000], // Resin=3μm, Heat sink=1mm
+  thickness_layers_nm: [1100000, 70, 65, 10, 55, 110, 3000, 1000000], // Resin=3μm, Heat sink=1mm
   layer_enabled: [true, true, true, true, true, true, false, false], // Resin과 Heat sink는 기본적으로 비활성화
   voltage: 2.9,
   current_density: 30.0, // 단위: mA/cm² (기존 300.0 A/m² = 30.0 mA/cm²)
-  eqe: 0.2, // External Quantum Efficiency (20%)
-  // 열원 모델
-  // - legacy_perov_eqe: 기존(Perovskite에만 V*J*(1-EQE) 적용)
-  // - split_vphoton_sigma: Vphoton(=hc/qλ) 기반 분해 + (V-Vphoton)*J를 레이어 저항(t/σ)로 분배
-  heat_source_model: 'split_vphoton_sigma',
+  eqe: 20.0, // External Quantum Efficiency (%)
+  // 열원 모델: Vphoton(=hc/qλ) 기반 계산, Perovskite에만 열원 적용
   emission_wavelength_nm: 540.0, // 발광 피크 파장 (nm) - CsPbBr3 기준
-  // 레이어별 전기전도도 σ (S/m) - 열원 분배에 사용(전기 경로 레이어만 의미 있음)
-  // Glass: 절연체, ITO: 투명전극, HTL(PEDOT:PSS AI4083): 유기전도성, Perovskite(CsPbBr3): 반도체, ETL(POT2T): 유기물, Cathode(Al): 금속
-  sigma_elec_layers: [0, 10000, 1000, 5, 0.01, 35000000, 0, 0], // [Glass, ITO, PEDOT:PSS AI4083, CsPbBr3, POT2T, Al, Resin, Heat sink]
   epsilon_top: 0.05,
   epsilon_bottom: 0.85,
   epsilon_side: 0.05, // 측면 방사율
   h_conv: 10.0,
   T_ambient: 25.0, // 섭씨 (°C)
   t_start: 0,
-  t_end: 1000.0,
-  device_area_mm2: 4.3, // 소자 크기 (mm²)
+  t_end: 250.0,
+  device_area_mm2: 3.78, // 소자 크기 (mm²)
   r_max_multiplier: 10.0 // r_max = 소자 반지름 × 이 값 (1~100)
 }
 
@@ -67,6 +61,10 @@ function App() {
   const [password, setPassword] = useState('')
   const [passwordError, setPasswordError] = useState('')
   const [isCheckingPassword, setIsCheckingPassword] = useState(true)
+  
+  // Transient 데이터 상태
+  const [transientData, setTransientData] = useState(null) // {time: [], voltage: [], current_density: []}
+  const [useTransient, setUseTransient] = useState(false)
 
   // 두께 단위 변환 함수들
   const convertToNm = (value, unit) => {
@@ -105,12 +103,7 @@ function App() {
   }
 
   const handleGlobalChange = (field, value) => {
-    // 문자열/선택형 파라미터는 별도 처리
-    if (field === 'heat_source_model') {
-      setFormData({ ...formData, [field]: value })
-    } else {
-      setFormData({ ...formData, [field]: parseFloat(value) || 0 })
-    }
+    setFormData({ ...formData, [field]: parseFloat(value) || 0 })
     // 입력값이 변경되면 이전 시뮬레이션 결과 초기화
     if (simulationResult) {
       setSimulationResult(null)
@@ -121,6 +114,106 @@ function App() {
     setFormData(DEFAULT_VALUES)
     setSimulationResult(null)
     setError(null)
+    setTransientData(null)
+    setUseTransient(false)
+  }
+  
+  // 엑셀 파일 읽기 함수
+  const handleExcelFileUpload = (event) => {
+    const file = event.target.files[0]
+    if (!file) return
+    
+    const reader = new FileReader()
+    reader.onload = (e) => {
+      try {
+        const data = new Uint8Array(e.target.result)
+        const workbook = XLSX.read(data, { type: 'array' })
+        
+        // 첫 번째 시트 읽기
+        const firstSheetName = workbook.SheetNames[0]
+        const worksheet = workbook.Sheets[firstSheetName]
+        
+        // JSON으로 변환
+        const jsonData = XLSX.utils.sheet_to_json(worksheet, { header: 1 })
+        
+        if (jsonData.length < 2) {
+          setError('엑셀 파일에 데이터가 충분하지 않습니다. (최소 2행 필요)')
+          return
+        }
+        
+        // 첫 번째 행을 헤더로 사용
+        const headers = jsonData[0].map(h => String(h).toLowerCase().trim())
+        
+        // t, V, J 컬럼 찾기
+        const tIndex = headers.findIndex(h => h === 't' || h === 'time' || h === '시간')
+        const vIndex = headers.findIndex(h => h === 'v' || h === 'voltage' || h === '전압')
+        const jIndex = headers.findIndex(h => h === 'j' || h === 'current_density' || h === 'current density' || h === '전류밀도' || h === '전류 밀도')
+        
+        if (tIndex === -1 || vIndex === -1 || jIndex === -1) {
+          setError(`필요한 컬럼을 찾을 수 없습니다. 헤더에 't' (또는 'time', '시간'), 'V' (또는 'voltage', '전압'), 'J' (또는 'current_density', 'current density', '전류밀도', '전류 밀도')가 있어야 합니다.`)
+          console.log('헤더:', headers)
+          return
+        }
+        
+        // 데이터 추출
+        const time = []
+        const voltage = []
+        const current_density = []
+        
+        for (let i = 1; i < jsonData.length; i++) {
+          const row = jsonData[i]
+          if (row[tIndex] !== undefined && row[vIndex] !== undefined && row[jIndex] !== undefined) {
+            const t = parseFloat(row[tIndex])
+            const v = parseFloat(row[vIndex])
+            const j = parseFloat(row[jIndex])
+            
+            if (!isNaN(t) && !isNaN(v) && !isNaN(j)) {
+              time.push(t)
+              voltage.push(v)
+              current_density.push(j)
+            }
+          }
+        }
+        
+        if (time.length === 0) {
+          setError('유효한 데이터를 찾을 수 없습니다.')
+          return
+        }
+        
+        // 시간이 단조 증가하는지 확인
+        for (let i = 1; i < time.length; i++) {
+          if (time[i] <= time[i-1]) {
+            setError(`시간 데이터가 단조 증가하지 않습니다. 행 ${i+1}에서 오류 발생.`)
+            return
+          }
+        }
+        
+        // 음수 값 확인
+        if (voltage.some(v => v < 0) || current_density.some(j => j < 0)) {
+          setError('전압과 전류밀도는 0 이상이어야 합니다.')
+          return
+        }
+        
+        setTransientData({ time, voltage, current_density })
+        setUseTransient(true)
+        setError(null)
+        
+        console.log(`엑셀 파일 로드 완료: ${time.length}개 데이터 포인트`)
+        console.log(`시간 범위: ${time[0]} ~ ${time[time.length-1]} 초`)
+        console.log(`전압 범위: ${Math.min(...voltage)} ~ ${Math.max(...voltage)} V`)
+        console.log(`전류밀도 범위: ${Math.min(...current_density)} ~ ${Math.max(...current_density)} mA/cm²`)
+        
+      } catch (error) {
+        console.error('엑셀 파일 읽기 오류:', error)
+        setError(`엑셀 파일 읽기 오류: ${error.message}`)
+      }
+    }
+    
+    reader.onerror = () => {
+      setError('파일 읽기 오류가 발생했습니다.')
+    }
+    
+    reader.readAsArrayBuffer(file)
   }
 
   // 레이어 활성화/비활성화 핸들러
@@ -232,9 +325,8 @@ function App() {
       const filteredRho = enabledIndices.map(idx => formData.rho_layers[idx])
       const filteredCp = enabledIndices.map(idx => formData.c_p_layers[idx])
       const filteredThickness = enabledIndices.map(idx => formData.thickness_layers_nm[idx])
-      const filteredSigmaElec = enabledIndices.map(idx => formData.sigma_elec_layers?.[idx] ?? 0)
       
-      // 섭씨를 켈빈으로 변환하여 백엔드에 전송
+      // 섭씨를 켈빈으로 변환, EQE를 %에서 소수로 변환하여 백엔드에 전송
       const dataToSend = {
         ...formData,
         layer_names: filteredLayerNames,
@@ -242,11 +334,16 @@ function App() {
         rho_layers: filteredRho,
         c_p_layers: filteredCp,
         thickness_layers_nm: filteredThickness,
-        sigma_elec_layers: filteredSigmaElec,
         layer_enabled: formData.layer_enabled,
         T_ambient: celsiusToKelvin(formData.T_ambient),
+        eqe: formData.eqe / 100, // % 단위를 소수로 변환 (20% → 0.2)
         device_area_mm2: formData.device_area_mm2,
-        r_max_multiplier: formData.r_max_multiplier
+        r_max_multiplier: formData.r_max_multiplier,
+        // Transient 데이터 추가
+        use_transient: useTransient && transientData !== null,
+        transient_time: useTransient && transientData ? transientData.time : null,
+        transient_voltage: useTransient && transientData ? transientData.voltage : null,
+        transient_current_density: useTransient && transientData ? transientData.current_density : null
       }
       
       // API URL 설정: 환경 변수가 있으면 사용, 없으면 개발 환경에서는 /api, 프로덕션에서는 Fly.io URL
@@ -411,6 +508,7 @@ function App() {
                   }
                   return celsius
                 }) : [],
+                glass_bottom_center_temp: result.glass_bottom_center_temp ? result.glass_bottom_center_temp.map(kelvin => kelvinToCelsius(kelvin)) : [],
                 // r 방향 프로파일 변환 (켈빈 -> 섭씨)
                 temp_profile_z_perovskite_r: result.temp_profile_z_perovskite_r ? result.temp_profile_z_perovskite_r.map(kelvin => {
                   const celsius = kelvinToCelsius(kelvin)
@@ -629,6 +727,21 @@ function App() {
     return time.map((t, idx) => ({
       time: t,
       temperature: perovskite_center_temp[idx]
+    }))
+  }
+
+  // Transient 입력(V/J/Q_A) 확인용 데이터
+  const getTransientInputProfile = () => {
+    if (!simulationResult || !simulationResult.transient_debug_series) return []
+    const s = simulationResult.transient_debug_series
+    if (!s.t_eval || !s.V_eval || !s.J_eval_mA_cm2 || !s.Q_A_eval_W_m2) return []
+
+    const n = Math.min(s.t_eval.length, s.V_eval.length, s.J_eval_mA_cm2.length, s.Q_A_eval_W_m2.length)
+    return Array.from({ length: n }, (_, idx) => ({
+      time: s.t_eval[idx],
+      V: s.V_eval[idx],
+      J: s.J_eval_mA_cm2[idx],
+      Q_A: s.Q_A_eval_W_m2[idx]
     }))
   }
   
@@ -961,6 +1074,16 @@ function App() {
         })
       }
       
+      // Sheet6: r=0, z=Glass 최하단(air 경계, z=0)에서 time에 따른 온도
+      const sheet6Data = []
+      sheet6Data.push(['시간 (s)', '온도 (°C)'])
+      if (simulationResult.glass_bottom_center_temp && time) {
+        const minLength = Math.min(simulationResult.glass_bottom_center_temp.length, time.length)
+        for (let idx = 0; idx < minLength; idx++) {
+          sheet6Data.push([Number(time[idx]), Number(simulationResult.glass_bottom_center_temp[idx])])
+        }
+      }
+      
       // Sheet4: r-z에 따른 최종온도
       const sheet4Data = []
       if (temperature_2d && r_mm && position_active_nm && temperature_2d.length > 0) {
@@ -1029,7 +1152,7 @@ function App() {
       sheet5Data.push(['전기적 파라미터', ''])
       sheet5Data.push(['전압 (V)', Number(formData.voltage)])
       sheet5Data.push(['전류 밀도 (mA/cm²)', Number(formData.current_density)])
-      sheet5Data.push(['EQE (External Quantum Efficiency)', Number(formData.eqe)])
+      sheet5Data.push(['EQE (External Quantum Efficiency) (%)', Number(formData.eqe)])
       sheet5Data.push(['소자 크기 (mm²)', Number(formData.device_area_mm2)])
       sheet5Data.push(['r_max 배수 (소자 반지름의 배수)', Number(formData.r_max_multiplier)])
       
@@ -1074,6 +1197,10 @@ function App() {
       // Sheet5: 입력 파라미터 및 시뮬레이션 요약
       const ws5 = XLSX.utils.aoa_to_sheet(sheet5Data)
       XLSX.utils.book_append_sheet(wb, ws5, '입력 파라미터 및 요약')
+      
+      // Sheet6: r=0, z=Glass 최하단(air 경계)에서 time에 따른 온도
+      const ws6 = XLSX.utils.aoa_to_sheet(sheet6Data)
+      XLSX.utils.book_append_sheet(wb, ws6, 'r=0, z=glass bottom, time')
       
       // 파일 저장
       const fileName = `simulation_result_${new Date().toISOString().split('T')[0]}.xlsx`
@@ -1312,17 +1439,6 @@ function App() {
                             disabled={showCheckbox && !formData.layer_enabled[index]}
                           />
                         </div>
-                        <div className="input-field">
-                          <label>전기전도도 σ (S/m)</label>
-                          <input
-                            type="number"
-                            value={formData.sigma_elec_layers?.[index] ?? 0}
-                            onChange={(e) => handleLayerChange(index, 'sigma_elec_layers', e.target.value)}
-                            step="any"
-                            min="0"
-                            disabled={showCheckbox && !formData.layer_enabled[index]}
-                          />
-                        </div>
                       </div>
                     </div>
                   )
@@ -1333,46 +1449,106 @@ function App() {
             {/* 전기적 파라미터 */}
             <div className="parameters-section">
               <h3>전기적 파라미터</h3>
-              <div className="parameters-grid">
-                <div className="input-field">
-                  <label>열원 모델</label>
-                  <select
-                    value={formData.heat_source_model}
-                    onChange={(e) => handleGlobalChange('heat_source_model', e.target.value)}
-                  >
-                    <option value="split_vphoton_sigma">Vphoton(λ) 분해 + (V−Vph)·J 저항분배</option>
-                    <option value="legacy_perov_eqe">기존: Perovskite에만 V·J·(1−EQE)</option>
-                  </select>
+              
+              {/* Transient 데이터 업로드 섹션 */}
+              <div style={{ marginBottom: '20px', padding: '15px', border: '1px solid #ddd', borderRadius: '8px', backgroundColor: '#f9f9f9' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '10px' }}>
+                  <input
+                    type="checkbox"
+                    id="useTransient"
+                    checked={useTransient}
+                    onChange={(e) => {
+                      setUseTransient(e.target.checked)
+                      if (!e.target.checked) {
+                        setTransientData(null)
+                      }
+                    }}
+                  />
+                  <label htmlFor="useTransient" style={{ fontWeight: 'bold', cursor: 'pointer' }}>
+                    Transient 데이터 사용 (엑셀 파일에서 시간에 따른 전압/전류밀도 읽기)
+                  </label>
                 </div>
+                
+                {useTransient ? (
+                  <div>
+                    <div style={{ marginBottom: '10px' }}>
+                      <label style={{ display: 'block', marginBottom: '5px', fontWeight: '500' }}>
+                        엑셀 파일 업로드 (컬럼: t, V, J)
+                      </label>
+                      <input
+                        type="file"
+                        accept=".xlsx,.xls"
+                        onChange={handleExcelFileUpload}
+                        style={{ padding: '5px' }}
+                      />
+                      <small style={{ display: 'block', color: '#666', marginTop: '5px' }}>
+                        엑셀 파일 형식: 첫 번째 행은 헤더(t, V, J), 두 번째 행부터 데이터. 시간(t)은 초 단위, 전압(V)은 V 단위, 전류밀도(J)는 mA/cm² 단위.
+                      </small>
+                    </div>
+                    
+                    {transientData && (
+                      <div style={{ padding: '10px', backgroundColor: '#e8f5e9', borderRadius: '5px', fontSize: '0.9em' }}>
+                        <strong>✓ 데이터 로드 완료:</strong>
+                        <ul style={{ margin: '5px 0', paddingLeft: '20px' }}>
+                          <li>데이터 포인트: {transientData.time.length}개</li>
+                          <li>시간 범위: {transientData.time[0].toFixed(2)} ~ {transientData.time[transientData.time.length-1].toFixed(2)} 초</li>
+                          <li>전압 범위: {Math.min(...transientData.voltage).toFixed(2)} ~ {Math.max(...transientData.voltage).toFixed(2)} V</li>
+                          <li>전류밀도 범위: {Math.min(...transientData.current_density).toFixed(2)} ~ {Math.max(...transientData.current_density).toFixed(2)} mA/cm²</li>
+                        </ul>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setTransientData(null)
+                            setUseTransient(false)
+                          }}
+                          style={{ marginTop: '5px', padding: '5px 10px', fontSize: '0.85em', cursor: 'pointer' }}
+                        >
+                          데이터 제거
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div style={{ fontSize: '0.9em', color: '#666' }}>
+                    체크하면 엑셀 파일에서 시간에 따른 전압과 전류밀도를 읽어서 시뮬레이션합니다.
+                  </div>
+                )}
+              </div>
+              
+              <div className="electrical-parameters-grid">
+                {/* 첫 번째 행 */}
                 <div className="input-field">
-                  <label>전압 (V)</label>
+                  <label>전압 (V) {useTransient && transientData ? '(엑셀 데이터 사용)' : ''}</label>
                   <input
                     type="number"
                     value={formData.voltage}
                     onChange={(e) => handleGlobalChange('voltage', e.target.value)}
                     step="0.1"
+                    disabled={useTransient && transientData !== null}
                   />
                 </div>
                 <div className="input-field">
-                  <label>전류 밀도 (mA/cm²)</label>
+                  <label>전류 밀도 (mA/cm²) {useTransient && transientData ? '(엑셀 데이터 사용)' : ''}</label>
                   <input
                     type="number"
                     value={formData.current_density}
                     onChange={(e) => handleGlobalChange('current_density', e.target.value)}
                     step="1"
+                    disabled={useTransient && transientData !== null}
                   />
                 </div>
                 <div className="input-field">
-                  <label>EQE (External Quantum Efficiency)</label>
+                  <label>EQE (External Quantum Efficiency) (%)</label>
                   <input
                     type="number"
                     value={formData.eqe}
                     onChange={(e) => handleGlobalChange('eqe', e.target.value)}
-                    step="0.01"
+                    step="0.1"
                     min="0"
-                    max="1"
+                    max="100"
                   />
                 </div>
+                {/* 두 번째 행 */}
                 <div className="input-field">
                   <label>발광 파장 λ (nm)</label>
                   <input
@@ -2604,6 +2780,45 @@ function App() {
                   </LineChart>
                 </ResponsiveContainer>
               </div>
+
+              {/* Transient 입력 확인용 그래프 (엑셀 transient 사용 시) */}
+              {simulationResult?.transient_debug_series && (
+                <div className="chart-container">
+                  <h3>Transient 입력(V/J) 및 열원(Q<sub>A</sub>) 확인</h3>
+                  <ResponsiveContainer width="100%" height={420}>
+                    <LineChart data={getTransientInputProfile()}>
+                      <CartesianGrid strokeDasharray="3 3" />
+                      <XAxis
+                        dataKey="time"
+                        type="number"
+                        label={{ value: '시간 (s)', position: 'insideBottom', offset: -5 }}
+                        angle={-45}
+                        textAnchor="end"
+                        height={80}
+                      />
+                      <YAxis
+                        yAxisId="left"
+                        label={{ value: 'V (V) / J (mA/cm²)', angle: -90, position: 'insideLeft' }}
+                        domain={['auto', 'auto']}
+                      />
+                      <YAxis
+                        yAxisId="right"
+                        orientation="right"
+                        label={{ value: 'Q_A (W/m²)', angle: 90, position: 'insideRight' }}
+                        domain={['auto', 'auto']}
+                      />
+                      <Tooltip />
+                      <Legend />
+                      <Line yAxisId="left" type="monotone" dataKey="V" name="V(t)" stroke="#2563eb" strokeWidth={2} dot={false} />
+                      <Line yAxisId="left" type="monotone" dataKey="J" name="J(t)" stroke="#f59e0b" strokeWidth={2} dot={false} />
+                      <Line yAxisId="right" type="monotone" dataKey="Q_A" name="Q_A(t)" stroke="#dc2626" strokeWidth={2} dot={false} />
+                    </LineChart>
+                  </ResponsiveContainer>
+                  <small style={{ display: 'block', color: '#666', marginTop: '6px' }}>
+                    이 그래프에서 100초(또는 설정한 시점) 이후 V/J/Q_A가 실제로 점프하는지 확인할 수 있습니다.
+                  </small>
+                </div>
+              )}
 
               {/* 저장 및 내보내기 버튼 */}
               <div style={{ marginTop: '30px', display: 'flex', gap: '10px', flexWrap: 'wrap' }}>

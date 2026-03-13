@@ -207,6 +207,12 @@ h3 {
   gap: 15px;
 }
 
+.electrical-parameters-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 15px;
+}
+
 /* 시뮬레이션 버튼 */
 .simulate-button {
   background: #333;
@@ -327,6 +333,10 @@ h3 {
   }
 
   .parameters-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .electrical-parameters-grid {
     grid-template-columns: 1fr;
   }
 

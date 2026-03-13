@@ -10,8 +10,10 @@
   },
   "scripts": {
     "dev": "vite",
-    "dev:backend": "python3 app.py",
-    "dev:all": "concurrently -n \"frontend,backend\" -c \"cyan,yellow\" \"pnpm dev\" \"pnpm dev:backend\"",
+    "dev:backend": "cross-env FLASK_DEBUG=true FLASK_USE_RELOADER=true python3 app.py",
+    "dev:backend:win": "cross-env FLASK_DEBUG=true FLASK_USE_RELOADER=true python app.py",
+    "dev:all": "concurrently -n \"frontend,backend\" -c \"cyan,yellow\" \"pnpm dev\" \"pnpm dev:backend:win\"",
+    "dev:all:mac": "concurrently -n \"frontend,backend\" -c \"cyan,yellow\" \"pnpm dev\" \"pnpm dev:backend\"",
     "build": "vite build",
     "preview": "vite preview",
     "lint": "eslint . --ext js,jsx --report-unused-disable-directives --max-warnings 0"
@@ -29,6 +31,7 @@
     "@types/react-dom": "^18.2.17",
     "@vitejs/plugin-react": "^4.2.1",
     "concurrently": "^8.2.2",
+    "cross-env": "^7.0.3",
     "eslint": "^8.55.0",
     "eslint-plugin-react": "^7.33.2",
     "eslint-plugin-react-hooks": "^4.6.0",

@@ -4,7 +4,7 @@ from werkzeug.exceptions import RequestEntityTooLarge, HTTPException
 import numpy as np
 from scipy import sparse
 from scipy.integrate import solve_ivp
-import json
+from scipy.interpolate import interp1d
 import traceback
 import os
 import threading
@@ -14,7 +14,6 @@ import atexit
 from numba import njit
 from concurrent.futures import ThreadPoolExecutor
 import tempfile
-import shutil
 
 app = Flask(__name__)
 CORS(app)
@@ -524,7 +523,6 @@ def debug_progress_store():
 def simulate():
     """시뮬레이션 요청을 받아 즉시 session_id를 반환하고, 실제 시뮬레이션은 별도 스레드에서 실행"""
     import uuid
-    import sys
     
     try:
         session_id = str(uuid.uuid4())
@@ -673,23 +671,106 @@ def _simulate_worker(session_id, data):
         c_p_layers_effective = c_p_layers.copy()
         
         # 입력 파라미터 검증
+        use_transient = data.get('use_transient', False)
+        transient_time = data.get('transient_time')
+        transient_voltage = data.get('transient_voltage')
+        transient_current_density = data.get('transient_current_density')
+        
         voltage = data.get('voltage')
         current_density_mA_per_cm2 = data.get('current_density')  # 입력 단위: mA/cm²
         eqe = data.get('eqe', 0.2)
+        emission_wavelength_nm = data.get('emission_wavelength_nm', 520.0)  # nm
         
-        # 입력 범위 검증
-        if voltage is None or voltage < 0:
-            raise ValueError("voltage가 없거나 음수입니다.")
-        if current_density_mA_per_cm2 is None or current_density_mA_per_cm2 < 0:
-            raise ValueError("current_density가 없거나 음수입니다.")
+        # Transient 데이터 검증 및 보간 함수 생성
+        voltage_interp = None
+        current_density_interp = None
+        # 디버깅/검증용: 결과에 포함할 (t_eval 기준) 전기 입력/열원 시계열
+        transient_debug_series = None
+        
+        if use_transient and transient_time is not None and transient_voltage is not None and transient_current_density is not None:
+            # Transient 데이터를 numpy 배열로 변환
+            transient_time = np.array(transient_time, dtype=np.float64)
+            transient_voltage = np.array(transient_voltage, dtype=np.float64)
+            transient_current_density = np.array(transient_current_density, dtype=np.float64)
+            
+            # 데이터 검증
+            if len(transient_time) == 0 or len(transient_voltage) == 0 or len(transient_current_density) == 0:
+                raise ValueError("transient 데이터가 비어있습니다.")
+            if len(transient_time) != len(transient_voltage) or len(transient_time) != len(transient_current_density):
+                raise ValueError(f"transient 데이터 길이가 일치하지 않습니다. time={len(transient_time)}, voltage={len(transient_voltage)}, current_density={len(transient_current_density)}")
+            
+            # 시간이 단조 증가하는지 확인
+            if not np.all(np.diff(transient_time) > 0):
+                raise ValueError("transient_time은 단조 증가해야 합니다.")
+            
+            # 음수 값 확인
+            if np.any(transient_voltage < 0) or np.any(transient_current_density < 0):
+                raise ValueError("transient 전압과 전류밀도는 0 이상이어야 합니다.")
+            
+            # 보간 함수 생성 (linear interpolation, 경계 밖에서는 가장 가까운 값 사용)
+            voltage_interp = interp1d(transient_time, transient_voltage, kind='linear', 
+                                      bounds_error=False, fill_value=(transient_voltage[0], transient_voltage[-1]))
+            current_density_interp = interp1d(transient_time, transient_current_density, kind='linear',
+                                              bounds_error=False, fill_value=(transient_current_density[0], transient_current_density[-1]))
+            
+            flush_print(f"=== Transient 데이터 로드 ===")
+            flush_print(f"데이터 포인트 수: {len(transient_time)}개")
+            flush_print(f"시간 범위: {transient_time[0]:.2f} ~ {transient_time[-1]:.2f} 초")
+            flush_print(f"전압 범위: {np.min(transient_voltage):.2f} ~ {np.max(transient_voltage):.2f} V")
+            flush_print(f"전류밀도 범위: {np.min(transient_current_density):.2f} ~ {np.max(transient_current_density):.2f} mA/cm²")
+        else:
+            # 상수 값 검증
+            if voltage is None or voltage < 0:
+                raise ValueError("voltage가 없거나 음수입니다.")
+            if current_density_mA_per_cm2 is None or current_density_mA_per_cm2 < 0:
+                raise ValueError("current_density가 없거나 음수입니다.")
+        
         if not (0 <= eqe <= 1):
             raise ValueError(f"eqe는 0~1 사이여야 합니다. 현재 값: {eqe}")
         
         # current_density 단위 변환: mA/cm² → A/m²
         # 1 mA/cm² = 0.001 A / (0.01 m)² = 0.001 A / 0.0001 m² = 10 A/m²
-        current_density_A_per_m2 = current_density_mA_per_cm2 * 10.0
+        if not use_transient or voltage_interp is None:
+            current_density_A_per_m2 = current_density_mA_per_cm2 * 10.0
         
-        Q_A = voltage * current_density_A_per_m2 * (1 - eqe)  # W/m²
+        # =========================
+        # 열원(면적당) 모델 (W/m²)
+        # 입력 전력(면적당): P_in = J * V
+        # 외부 광출력(면적당): P_opt,out = J * Vphoton_eff * EQE
+        # 열원(면적당): Q_A = P_in - P_opt,out
+        #  - 안전장치: Vphoton_eff = min(V, Vphoton)
+        # =========================
+        # 상수 (SI)
+        h = 6.62607015e-34  # J·s
+        c0 = 2.99792458e8   # m/s
+        q_e = 1.602176634e-19  # C
+
+        if emission_wavelength_nm is None or emission_wavelength_nm <= 0:
+            raise ValueError(f"emission_wavelength_nm은 0보다 커야 합니다. 현재 값: {emission_wavelength_nm}")
+
+        lam_m = float(emission_wavelength_nm) * 1e-9
+        V_photon = (h * c0) / (q_e * lam_m)  # V
+        
+        # Transient 모드가 아닌 경우에만 상수 값 계산
+        if not use_transient or voltage_interp is None:
+            V_photon_eff = min(float(voltage), float(V_photon))
+            # 입력 전력(면적당)
+            electrical_in_A = current_density_A_per_m2 * float(voltage)  # W/m²
+            # 면적당 광출력(외부)
+            optical_out_A = current_density_A_per_m2 * V_photon_eff * eqe  # W/m²
+            # 열원(면적당)
+            Q_A = electrical_in_A - optical_out_A
+        else:
+            # Transient 모드: 초기값만 계산 (실제 값은 pde_system에서 시간에 따라 계산)
+            # 초기 시간의 값으로 초기화
+            initial_time = transient_time[0] if len(transient_time) > 0 else 0.0
+            initial_voltage = float(voltage_interp(initial_time))
+            initial_current_density_mA_per_cm2 = float(current_density_interp(initial_time))
+            initial_current_density_A_per_m2 = initial_current_density_mA_per_cm2 * 10.0
+            V_photon_eff_initial = min(initial_voltage, float(V_photon))
+            electrical_in_A_initial = initial_current_density_A_per_m2 * initial_voltage  # W/m²
+            optical_out_A = initial_current_density_A_per_m2 * V_photon_eff_initial * eqe  # W/m² (디버깅용)
+            Q_A = electrical_in_A_initial - optical_out_A  # 초기값 (디버깅용)
         
         epsilon_top = data.get('epsilon_top')
         epsilon_bottom = data.get('epsilon_bottom')
@@ -714,7 +795,7 @@ def _simulate_worker(session_id, data):
             raise ValueError(f"T_ambient는 0 이상이어야 합니다. 현재 값: {T_ambient}")
         
         t_start = data.get('t_start', 0)
-        t_end = data.get('t_end', 1000.0)
+        t_end = data.get('t_end', 250.0)
         
         # 시간 범위 검증
         if t_start < 0:
@@ -734,13 +815,25 @@ def _simulate_worker(session_id, data):
         # t_eval 생성: t_span 범위 내에 있도록 보장 (모든 시간 범위에서 안정적으로 작동)
         # solve_ivp 요구사항: t_eval의 모든 값이 t_span [t_start, t_end] 범위 내에 있어야 함
         
-        # 전략: 로그 스케일을 사용하되, 항상 안전하게 처리
-        # 1. t_start가 0이거나 매우 작으면 균등 간격 사용
-        # 2. 그 외에는 로그 스케일 사용하되, 항상 범위 내에 있도록 보장
+        # 전략: 초반을 촘촘히 보기 위해 기본은 로그 스케일을 사용하되, 항상 안전하게 처리
+        # 1. t_start가 0이거나 매우 작으면: 0을 포함하고 (0, t_end]는 로그 스케일로 생성
+        # 2. 그 외에는: 로그 스케일 사용하되, 항상 범위 내에 있도록 보장
         
         if t_start <= 0 or t_start < 1e-9:
-            # t_start가 0이거나 매우 작은 경우: 균등 간격 사용
-            t_eval = np.linspace(t_start, t_end, n_time_points)
+            # t_start가 0이거나 매우 작은 경우:
+            # - 첫 점은 정확히 0
+            # - 나머지는 (eps, t_end] 로그 분포로 초반을 촘촘히 샘플링
+            # 주의: log(0)은 불가하므로 eps > 0 필요
+            if t_end <= 0:
+                t_eval = np.linspace(t_start, t_end, n_time_points)
+            else:
+                # eps는 t_end 스케일에 비례하되 너무 작지 않게 제한
+                eps = max(1e-9, float(t_end) * 1e-6)
+                if eps >= t_end:
+                    t_eval = np.linspace(t_start, t_end, n_time_points)
+                else:
+                    t_log = np.logspace(np.log10(eps), np.log10(t_end), n_time_points - 1)
+                    t_eval = np.concatenate(([t_start], t_log))
         else:
             # 로그 스케일 사용
             try:
@@ -807,6 +900,23 @@ def _simulate_worker(session_id, data):
         assert np.all(np.diff(t_eval) >= 0), "t_eval이 단조 증가하지 않음"
         
         flush_print(f"✅ t_eval 생성 완료: {len(t_eval)}개 포인트, 범위=[{np.min(t_eval):.6e}, {np.max(t_eval):.6e}], t_span=[{t_start:.6e}, {t_end:.6e}]")
+
+        # transient 모드면 t_eval에서 실제로 사용될 V(t), J(t), Q_A(t)를 미리 계산해서 결과에 넣어둠
+        # (사용자가 “열원이 반영됐는지”를 바로 확인할 수 있게 함)
+        if use_transient and voltage_interp is not None and current_density_interp is not None:
+            v_eval = voltage_interp(t_eval).astype(np.float64, copy=False)
+            j_eval_mA_cm2 = current_density_interp(t_eval).astype(np.float64, copy=False)
+            j_eval_A_m2 = j_eval_mA_cm2 * 10.0
+            vph_eff_eval = np.minimum(v_eval, float(V_photon))
+            electrical_in_eval = j_eval_A_m2 * v_eval  # W/m²
+            optical_out_eval = j_eval_A_m2 * vph_eff_eval * float(eqe)  # W/m²
+            qA_eval = electrical_in_eval - optical_out_eval  # W/m²
+            transient_debug_series = {
+                't_eval': t_eval.tolist(),
+                'V_eval': v_eval.tolist(),
+                'J_eval_mA_cm2': j_eval_mA_cm2.tolist(),
+                'Q_A_eval_W_m2': qA_eval.tolist()
+            }
         
         # 2D 원통좌표계 그리드 설정
         # r 방향: 0부터 R_max까지 (소자 반지름보다 크게 설정)
@@ -851,8 +961,6 @@ def _simulate_worker(session_id, data):
         start_idx = 0
         num_layers = min(len(layer_names), len(thickness_layers), len(points_per_layer))
         
-        debug_messages = []
-        debug_messages.append("=== z 방향 그리드 생성 ===")
         flush_print(f"=== z 방향 그리드 생성 ===")
         for i in range(num_layers):
             thickness = thickness_layers[i]
@@ -864,11 +972,8 @@ def _simulate_worker(session_id, data):
             start_idx = end_idx
         
         z = np.array(z_nodes)
-        # 셀 두께 배열 명확히 정의: dz_cell[j] = z[j+1] - z[j] (j=0부터 Nz-2까지)
-        # 경계 조건에서 사용할 실제 셀 두께
+        # 셀 두께 배열: dz_cell[j] = z[j+1] - z[j] (j=0부터 Nz-2까지)
         dz_cell = z[1:] - z[:-1]  # 길이: Nz-1
-        # 인터페이스 간격 배열 (라플라시안 계산용, 길이 Nz로 맞춤)
-        dz = np.concatenate([dz_cell, [dz_cell[-1]]]) if len(dz_cell) > 0 else np.array([1e-9])
         Nz = len(z)
         
         # DoS 방지: Nz 상한 검증
@@ -893,16 +998,9 @@ def _simulate_worker(session_id, data):
         
         # 두 구간 결합 (중복 제거)
         r = np.concatenate([r_fine, r_coarse_log[1:]])
-        # 셀 두께 배열 명확히 정의: dr_cell[i] = r[i+1] - r[i] (i=0부터 Nr-2까지)
-        # 경계 조건에서 사용할 실제 셀 두께
+        # 셀 두께 배열: dr_cell[i] = r[i+1] - r[i] (i=0부터 Nr-2까지)
         dr_cell = r[1:] - r[:-1]  # 길이: Nr-1
-        # 인터페이스 간격 배열 (라플라시안 계산용, 길이 Nr로 맞춤)
-        # r=0에서 dr[0] 사용 (r=0은 특이점이므로 첫 번째 셀의 두께 사용)
-        dr = np.concatenate([[r[1] - r[0]], dr_cell]) if len(dr_cell) > 0 else np.array([1e-9])
         Nr = len(r)
-        
-        # 2D 그리드 메시
-        R, Z = np.meshgrid(r, z, indexing='ij')  # R[i,j], Z[i,j] = (r[i], z[j])
         
         # 물성 배열 (2D) - 등방성 열전도도 (압축 제거로 이방성 불필요)
         # 모든 레이어는 등방성: k_r = k_z = k_therm_layers[i]
@@ -920,7 +1018,7 @@ def _simulate_worker(session_id, data):
             k_z_grid[:, z_slice] = k_therm_layers[i]
             rho_cp_grid[:, z_slice] = rho_layers_effective[i] * c_p_layers_effective[i]
         
-        # 열원 위치 (Perovskite 레이어, r < device_radius_m 영역)
+        # 열원 위치 (r < device_radius_m 영역, 레이어별 분배 가능)
         try:
             perovskite_layer_index = layer_names.index('Perovskite')
         except ValueError:
@@ -938,26 +1036,48 @@ def _simulate_worker(session_id, data):
         if L_perovskite <= 0:
             raise ValueError(f"Perovskite 레이어 두께가 0 이하입니다. L_perovskite = {L_perovskite} m")
         
-        # 열원 마스크: r < device_radius_m이고 Perovskite 레이어인 영역
-        source_mask = np.zeros((Nr, Nz), dtype=bool)
-        for i in range(Nr):
-            if r[i] < device_radius_m:
-                source_mask[i, perovskite_z_slice] = True
+        # 레이어별 열원 생성 (K/s)
+        radial_mask = (r < device_radius_m)  # shape: (Nr,)
         
-        # 열원 강도 (W/m³)
-        # Q_A는 W/m²이므로, Perovskite 두께로 나누어 W/m³로 변환
-        Q_volumetric = Q_A / L_perovskite  # W/m³
-        C_source_term = Q_volumetric / (rho_layers[perovskite_layer_index] * c_p_layers[perovskite_layer_index])
-        
+        # Transient 모드가 아닌 경우에만 상수 열원 생성
+        if not use_transient or voltage_interp is None:
+            source_grid = np.zeros((Nr, Nz), dtype=np.float64)
+            # Perovskite 열원만 적용 (Transport 열원 제거)
+            perov_q_vol = Q_A / L_perovskite  # W/m³
+            perov_rho_cp = rho_layers_effective[perovskite_layer_index] * c_p_layers_effective[perovskite_layer_index]
+            perov_C = perov_q_vol / perov_rho_cp  # K/s
+            source_grid[radial_mask, perovskite_z_slice] += perov_C
+            source_flat = source_grid.reshape(-1).astype(np.float64, copy=False)
+        else:
+            # Transient 모드: source_grid는 pde_system에서 시간에 따라 계산
+            source_grid = None
+            source_flat = None  # pde_system에서 동적으로 계산
+
         # 디버깅: 열원 정보 출력
-        num_source_nodes = np.sum(source_mask)
-        flush_print(f"=== 열원 정보 ===")
-        flush_print(f"Q_A = {Q_A:.2f} W/m²")
+        if use_transient and voltage_interp is not None:
+            flush_print(f"=== 열원 정보 (Transient 모드) ===")
+            flush_print(f"모드: Transient (시간에 따라 변하는 전압/전류밀도)")
+            initial_time = transient_time[0] if len(transient_time) > 0 else 0.0
+            initial_voltage = float(voltage_interp(initial_time))
+            initial_current_density_mA_per_cm2 = float(current_density_interp(initial_time))
+            initial_current_density_A_per_m2 = initial_current_density_mA_per_cm2 * 10.0
+            V_photon_eff_initial = min(initial_voltage, float(V_photon))
+            electrical_in_A_initial = initial_current_density_A_per_m2 * initial_voltage
+            optical_out_A_initial = initial_current_density_A_per_m2 * V_photon_eff_initial * eqe
+            Q_A_initial = electrical_in_A_initial - optical_out_A_initial
+            flush_print(f"초기 시간 (t={initial_time:.2f} s)에서의 값:")
+            flush_print(f"  전압: {initial_voltage:.2f} V")
+            flush_print(f"  전류밀도: {initial_current_density_mA_per_cm2:.2f} mA/cm²")
+            flush_print(f"  Q_A(초기) = {Q_A_initial:.2f} W/m²")
+        else:
+            num_source_nodes = int(np.sum(source_grid != 0))
+            flush_print(f"=== 열원 정보 (상수 모드) ===")
+            flush_print(f"Q_A(total) = {Q_A:.2f} W/m²")
+            flush_print(f"열원이 적용되는 노드 수(0이 아닌 노드): {num_source_nodes}개")
+        
+        flush_print(f"emission_wavelength_nm = {float(emission_wavelength_nm):.2f} nm")
+        flush_print(f"V_photon = {float(V_photon):.4f} V")
         flush_print(f"L_perovskite = {L_perovskite*1e9:.2f} nm")
-        flush_print(f"Q_volumetric = {Q_volumetric:.2e} W/m³")
-        flush_print(f"rho_cp = {rho_layers[perovskite_layer_index] * c_p_layers[perovskite_layer_index]:.2e} J/(m³·K)")
-        flush_print(f"C_source_term = {C_source_term:.6e} K/s")
-        flush_print(f"열원이 적용되는 노드 수: {num_source_nodes}개")
         flush_print(f"device_radius_m = {device_radius_m*1e3:.4f} mm")
         flush_print(f"r[0] = {r[0]*1e3:.4f} mm, r[-1] = {r[-1]*1e3:.4f} mm")
         
@@ -971,9 +1091,10 @@ def _simulate_worker(session_id, data):
             raise ValueError(f"총 노드 수(Nr * Nz)는 {MAX_N_TOTAL} 이하여야 합니다. 현재 값: {N_total} (Nr={Nr}, Nz={Nz})")
         
         # RHS 최적화: 사전 계산된 값들
-        # 1. 열원 항 사전 계산 (flat 벡터)
-        source_flat = np.zeros(N_total)
-        source_flat[source_mask.ravel()] = C_source_term
+        # 1. 열원 항 사전 계산 (flat 벡터) - Transient 모드가 아닌 경우에만
+        if source_flat is None:
+            # Transient 모드: source_flat은 None으로 유지 (pde_system에서 계산)
+            pass
         
         # 2. 경계 노드 인덱스 사전 계산 (Flat index)
         idx_z_bottom = np.arange(Nr) * Nz           # z=0
@@ -1104,7 +1225,32 @@ def _simulate_worker(session_id, data):
             dTdt = laplacian_csr.dot(T_flat)
             
             # (2) 열원 항 더하기 (In-place 연산으로 임시 배열 생성 방지)
-            dTdt += source_flat
+            if use_transient and voltage_interp is not None:
+                # Transient 모드: 현재 시간에 맞는 전압/전류밀도 보간
+                current_voltage = float(voltage_interp(t))
+                current_current_density_mA_per_cm2 = float(current_density_interp(t))
+                current_current_density_A_per_m2 = current_current_density_mA_per_cm2 * 10.0
+                
+                # 현재 시간의 V_photon_eff 계산
+                V_photon_eff_current = min(current_voltage, float(V_photon))
+                
+                # 현재 시간의 열원 계산 (Q_A = J*V - J*Vphoton_eff*EQE)
+                electrical_in_A_current = current_current_density_A_per_m2 * current_voltage  # W/m²
+                optical_out_A_current = current_current_density_A_per_m2 * V_photon_eff_current * eqe  # W/m²
+                Q_A_current = electrical_in_A_current - optical_out_A_current  # W/m²
+                perov_q_vol_current = Q_A_current / L_perovskite  # W/m³
+                perov_rho_cp = rho_layers_effective[perovskite_layer_index] * c_p_layers_effective[perovskite_layer_index]
+                perov_C_current = perov_q_vol_current / perov_rho_cp  # K/s
+                
+                # 열원을 source_grid에 적용 (매번 새로 계산)
+                source_grid_current = np.zeros((Nr, Nz), dtype=np.float64)
+                source_grid_current[radial_mask, perovskite_z_slice] += perov_C_current
+                source_flat_current = source_grid_current.reshape(-1).astype(np.float64, copy=False)
+                
+                dTdt += source_flat_current
+            else:
+                # 상수 모드: 사전 계산된 source_flat 사용
+                dTdt += source_flat
             
             # 진행률 계산 (5% ~ 95%)
             progress_pct = 5 + (t - t_start) / (t_end - t_start) * 90
@@ -1134,16 +1280,11 @@ def _simulate_worker(session_id, data):
             # 첫 시간 스텝 디버깅
             if t == t_start or abs(t - t_start) < 1e-6:
                 T_center = T_flat[0]
-                dTdt_source_val = source_flat[0] if source_flat[0] != 0 else 0.0
-                dTdt_transport_val = dTdt[0] - source_flat[0]
-                flush_print(f"=== 첫 시간 스텝 디버깅 (t={t}) ===")
+                flush_print(f"=== 솔버 시작 (t={t}, t_end={t_end:.1f} s) ===")
                 flush_print(f"T[0, 0] = {T_center:.2f} K")
-                flush_print(f"dTdt_source[0] = {dTdt_source_val:.6f}")
-                flush_print(f"dTdt_transport[0] = {dTdt_transport_val:.6f}")
-                flush_print(f"laplacian_csr[0, 0] = {laplacian_csr[0, 0]:.6f}")
-                if source_flat[0] != 0:
-                    flush_print(f"열원 위치: source_flat[0] = {source_flat[0]:.6f}, C_source_term = {C_source_term:.6f}")
-                flush_print(f"솔버 시작... (t_end = {t_end:.1f} s)")
+                # transient 모드에서는 source_flat이 None이므로 가드 필요
+                if source_flat is not None and len(source_flat) > 0 and source_flat[0] != 0:
+                    flush_print(f"열원: source_flat[0] = {source_flat[0]:.6f} K/s")
                 update_progress(10, f'솔버 시작... (t_end = {t_end:.1f} s)')
             
             # (3) 경계 플럭스 반영 (Flat indexing 사용, reshape 없이 직접 연산)
@@ -1282,30 +1423,17 @@ def _simulate_worker(session_id, data):
         
         start_time = time.time()
         
-        # Jacobian 사용 여부 선택 (성능 비교용)
-        # True: 명시적 Jacobian 사용 (정확하지만 느릴 수 있음)
-        # False: 수치 Jacobian 사용 (BDF 내부 추정, 빠를 수 있음)
-        use_explicit_jacobian = True  # 성능 테스트 시 False로 변경 가능
-        
         try:
-            solver_kwargs = {
-                'fun': pde_system,
-                't_span': [t_start, t_end],
-                'y0': T0_flat,
-                't_eval': t_eval,
-                'method': 'BDF',
-                'atol': 1e-6,  # 절대 오차 허용 범위 (더 엄격하게 설정)
-                'rtol': 1e-4   # 상대 오차 허용 범위 (더 엄격하게 설정)
-            }
-            
-            # Jacobian 사용 여부에 따라 조건부 추가
-            if use_explicit_jacobian:
-                solver_kwargs['jac'] = jacobian
-                flush_print("=== 명시적 Jacobian 사용 ===")
-            else:
-                flush_print("=== 수치 Jacobian 사용 (BDF 내부 추정) ===")
-            
-            sol = solve_ivp(**solver_kwargs)
+            sol = solve_ivp(
+                fun=pde_system,
+                t_span=[t_start, t_end],
+                y0=T0_flat,
+                t_eval=t_eval,
+                method='BDF',
+                jac=jacobian,
+                atol=1e-6,
+                rtol=1e-4
+            )
         except ValueError as cancel_error:
             # 취소 예외 처리
             if "취소" in str(cancel_error) or "cancel" in str(cancel_error).lower():
@@ -1551,29 +1679,20 @@ def _simulate_worker(session_id, data):
             perovskite_end_idx = layer_indices_map[perovskite_layer_index].stop
             perovskite_mid_idx = (perovskite_start_idx + perovskite_end_idx) // 2
             
-            # 디버깅 정보
-            print(f"perovskite_layer_index: {perovskite_layer_index}")
-            print(f"perovskite_start_idx: {perovskite_start_idx}, perovskite_end_idx: {perovskite_end_idx}")
-            print(f"perovskite_mid_idx: {perovskite_mid_idx}, T_result.shape[1]: {T_result.shape[1]}")
-            
             if perovskite_mid_idx < T_result.shape[1] and perovskite_mid_idx >= 0:
                 perovskite_center_temp = T_result[0, perovskite_mid_idx, :].tolist()
-                print(f"perovskite_center_temp (first 5): {perovskite_center_temp[:5] if len(perovskite_center_temp) > 5 else perovskite_center_temp}")
             else:
                 # 안전한 대체: Perovskite 레이어 내의 유효한 인덱스 사용
                 if perovskite_start_idx < T_result.shape[1] and perovskite_start_idx >= 0:
                     perovskite_center_temp = T_result[0, perovskite_start_idx, :].tolist()
                     perovskite_mid_idx = perovskite_start_idx
-                    print(f"Using perovskite_start_idx instead: {perovskite_start_idx}")
                 else:
                     perovskite_mid_idx = max(0, min(T_result.shape[1]-1, Nz//2))
                     perovskite_center_temp = T_result[0, perovskite_mid_idx, :].tolist() if T_result.shape[1] > 0 else []
-                    print(f"Using fallback index")
         else:
             # perovskite_layer_index가 유효하지 않은 경우 중간 인덱스 사용
             perovskite_mid_idx = T_result.shape[1] // 2 if T_result.shape[1] > 0 else 0
             perovskite_center_temp = T_result[0, perovskite_mid_idx, :].tolist() if T_result.shape[1] > 0 else []
-            print(f"perovskite_layer_index invalid, using mid_z_idx: {perovskite_mid_idx}")
         
         # 세 가지 프로파일 계산
         # 1. r=0에서 z에 따른 최종온도 프로파일 (ITO부터 Cathode 끝까지만)
@@ -1618,6 +1737,10 @@ def _simulate_worker(session_id, data):
         if len(perovskite_center_temp) > 0:
             flush_print(f"온도 범위: {min(perovskite_center_temp):.2f} ~ {max(perovskite_center_temp):.2f} K")
         
+        # Glass 최하단(air 경계, z=0)에서 r=0의 시간에 따른 온도 프로파일
+        # z=0은 하부 경계(Glass/air)로 사용되며, grid 상 j=0에 해당
+        glass_bottom_center_temp = T_result[0, 0, :].tolist() if (Nr > 0 and Nz > 0) else []
+
         
         # NumPy 타입 변환
         def convert_to_python_type(obj):
@@ -1662,7 +1785,10 @@ def _simulate_worker(session_id, data):
                 'temp_profile_r0_z': np.array(temp_profile_r0_z),
                 'z_profile_nm': np.array(z_profile_nm),
                 'temp_profile_z_perovskite_r': np.array(temp_profile_z_perovskite_r),
-                'perovskite_mid_z_nm': z_nm[perovskite_mid_idx] if perovskite_mid_idx is not None and perovskite_mid_idx < len(z_nm) else None
+                'perovskite_mid_z_nm': z_nm[perovskite_mid_idx] if perovskite_mid_idx is not None and perovskite_mid_idx < len(z_nm) else None,
+                'glass_bottom_center_temp': np.array(glass_bottom_center_temp),
+                # transient 검증용 시계열(있을 때만)
+                'transient_debug_series': transient_debug_series
             }
             
             # 결과를 디스크에 저장 (npz 형식)
@@ -1689,7 +1815,10 @@ def _simulate_worker(session_id, data):
                 'temp_profile_r0_z_time': convert_to_python_type(temp_profile_r0_z_time) if temp_profile_r0_z_time is not None else None,  # r=0에서 z, time에 따른 온도 (Sheet1용)
                 'z_profile_nm_sampled': convert_to_python_type(z_profile_nm_sampled) if temp_profile_r0_z_time is not None else None,  # 샘플링된 z 좌표
                 'temp_profile_z_perovskite_r': convert_to_python_type(temp_profile_z_perovskite_r),
-                'perovskite_mid_z_nm': float(z_nm[perovskite_mid_idx]) if perovskite_mid_idx is not None and perovskite_mid_idx < len(z_nm) else None
+                'perovskite_mid_z_nm': float(z_nm[perovskite_mid_idx]) if perovskite_mid_idx is not None and perovskite_mid_idx < len(z_nm) else None,
+                'glass_bottom_center_temp': convert_to_python_type(glass_bottom_center_temp),
+                # transient 검증용 시계열(있을 때만)
+                'transient_debug_series': convert_to_python_type(transient_debug_series)
             }
             
             flush_print(f"=== 결과 반환 준비 완료 ===")
