@@ -15,6 +15,18 @@ from numba import njit
 from concurrent.futures import ThreadPoolExecutor
 import tempfile
 
+# 윈도우 환경에서 이모지 출력 시 인코딩 오류 방지
+if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+if sys.stderr and hasattr(sys.stderr, 'reconfigure'):
+    try:
+        sys.stderr.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+
 app = Flask(__name__)
 CORS(app)
 
@@ -85,9 +97,9 @@ def cleanup_old_progress():
             if os.path.exists(result_file):
                 try:
                     os.remove(result_file)
-                    flush_print(f"🗑️ 오래된 결과 파일 삭제: {sid}")
+                    flush_print(f"오래된 결과 파일 삭제: {sid}")
                 except Exception as e:
-                    flush_print(f"⚠️ 결과 파일 삭제 실패 ({sid}): {e}")
+                    flush_print(f"경고: 결과 파일 삭제 실패 ({sid}): {e}")
 
 # 주기적으로 진행률 정리하는 백그라운드 스레드
 cleanup_thread_running = threading.Event()
@@ -101,7 +113,7 @@ def periodic_cleanup_worker():
             time.sleep(60)  # 1분마다 실행
             cleanup_old_progress()
         except Exception as e:
-            flush_print(f"⚠️ 주기적 정리 중 오류: {e}")
+            flush_print(f"경고: 주기적 정리 중 오류: {e}")
 
 # 백그라운드 정리 스레드 시작
 cleanup_thread = threading.Thread(target=periodic_cleanup_worker, daemon=True, name="cleanup_worker")
@@ -110,7 +122,7 @@ cleanup_thread.start()
 # 프로세스 종료 시 정리 함수
 def cleanup_on_exit():
     """프로세스 종료 시 실행되는 정리 함수"""
-    flush_print("🛑 프로세스 종료 중... 정리 작업 수행")
+    flush_print("프로세스 종료 중... 정리 작업 수행")
     
     # 백그라운드 정리 스레드 중지
     cleanup_thread_running.clear()
@@ -119,11 +131,11 @@ def cleanup_on_exit():
     
     # ThreadPoolExecutor 종료 (대기 중인 작업은 취소)
     executor.shutdown(wait=False)
-    flush_print("✅ ThreadPoolExecutor 종료됨")
+    flush_print("ThreadPoolExecutor 종료됨")
     
     # 마지막으로 한 번 더 정리 실행
     cleanup_old_progress()
-    flush_print("✅ 정리 작업 완료")
+    flush_print("정리 작업 완료")
 
 # atexit에 정리 함수 등록
 atexit.register(cleanup_on_exit)
@@ -347,7 +359,7 @@ def handle_general_exception(e):
     
     error_msg = f"서버 오류가 발생했습니다: {str(e)}"
     error_type = type(e).__name__
-    flush_print(f"❌ 전역 예외 핸들러에서 오류 포착: {error_type}: {error_msg}")
+    flush_print(f"오류: 전역 예외 핸들러에서 오류 포착: {error_type}: {error_msg}")
     flush_print(traceback.format_exc())
     
     return jsonify({
@@ -403,7 +415,7 @@ def check_password():
             }), 401
             
     except Exception as e:
-        flush_print(f"⚠️ 비밀번호 확인 오류: {e}")
+        flush_print(f"경고: 비밀번호 확인 오류: {e}")
         flush_print(traceback.format_exc())
         return jsonify({
             'success': False,
@@ -440,7 +452,7 @@ def get_progress(session_id):
         
         return jsonify(response)
     except Exception as e:
-        flush_print(f"⚠️ 진행률 조회 에러 (session_id={session_id}): {e}")
+        flush_print(f"경고: 진행률 조회 에러 (session_id={session_id}): {e}")
         flush_print(traceback.format_exc())
         return jsonify({
             'progress': 0,
@@ -456,7 +468,7 @@ def cancel_simulation(session_id):
     try:
         with cancel_lock:
             cancel_flags[session_id] = True
-            flush_print(f"🛑 시뮬레이션 취소 요청: {session_id}")
+            flush_print(f"시뮬레이션 취소 요청: {session_id}")
         
         # 진행률 업데이트
         with progress_lock:
@@ -469,7 +481,7 @@ def cancel_simulation(session_id):
             'message': '시뮬레이션 취소 요청이 전달되었습니다.'
         })
     except Exception as e:
-        flush_print(f"⚠️ 취소 요청 처리 오류: {e}")
+        flush_print(f"경고: 취소 요청 처리 오류: {e}")
         return jsonify({
             'success': False,
             'error': f'취소 요청 처리 중 오류: {str(e)}'
@@ -532,7 +544,7 @@ def simulate():
         try:
             data = request.json
         except Exception as json_error:
-            flush_print(f"⚠️ JSON 파싱 오류: {json_error}")
+            flush_print(f"경고: JSON 파싱 오류: {json_error}")
             flush_print(traceback.format_exc())
             return jsonify({
                 'success': False, 
@@ -547,7 +559,7 @@ def simulate():
             with progress_lock:
                 progress_store[session_id] = {'progress': 0, 'message': '초기화 중...', 'timestamp': time.time()}
         except Exception as lock_error:
-            flush_print(f"⚠️ 진행률 초기화 오류: {lock_error}")
+            flush_print(f"경고: 진행률 초기화 오류: {lock_error}")
             flush_print(traceback.format_exc())
             return jsonify({
                 'success': False,
@@ -560,7 +572,7 @@ def simulate():
                 _simulate_worker(session_id, data)
             except Exception as e:
                 error_msg = f"시뮬레이션 실행 중 오류: {str(e)}"
-                flush_print(f"❌ {error_msg}")
+                flush_print(f"오류: {error_msg}")
                 flush_print(f"트레이스백:\n{traceback.format_exc()}")
                 with progress_lock:
                     progress_store[session_id] = {
@@ -574,7 +586,7 @@ def simulate():
         try:
             executor.submit(run_simulation)
         except Exception as submit_error:
-            flush_print(f"⚠️ 시뮬레이션 제출 오류: {submit_error}")
+            flush_print(f"경고: 시뮬레이션 제출 오류: {submit_error}")
             flush_print(traceback.format_exc())
             # 진행률 저장소에서 세션 제거
             with progress_lock:
@@ -861,7 +873,7 @@ def _simulate_worker(session_id, data):
                 
             except (ValueError, OverflowError) as e:
                 # 로그 계산 실패 시 균등 간격 사용
-                flush_print(f"⚠️ 로그 스케일 계산 실패: {e}, 균등 간격으로 대체")
+                flush_print(f"경고: 로그 스케일 계산 실패: {e}, 균등 간격으로 대체")
                 t_eval = np.linspace(t_start, t_end, n_time_points)
         
         # 최종 검증 및 보정: t_eval이 정확히 [t_start, t_end] 범위 내에 있는지 확인
@@ -873,12 +885,12 @@ def _simulate_worker(session_id, data):
         
         # 범위 검증
         if min_t_eval < t_start - tolerance:
-            flush_print(f"⚠️ t_eval 최소값이 t_start보다 작음: min={min_t_eval:.6e}, t_start={t_start:.6e}")
+            flush_print(f"경고: t_eval 최소값이 t_start보다 작음: min={min_t_eval:.6e}, t_start={t_start:.6e}")
             t_eval = np.clip(t_eval, t_start, t_end)
             t_eval = np.sort(t_eval)
         
         if max_t_eval > t_end + tolerance:
-            flush_print(f"⚠️ t_eval 최대값이 t_end보다 큼: max={max_t_eval:.6e}, t_end={t_end:.6e}")
+            flush_print(f"경고: t_eval 최대값이 t_end보다 큼: max={max_t_eval:.6e}, t_end={t_end:.6e}")
             t_eval = np.clip(t_eval, t_start, t_end)
             t_eval = np.sort(t_eval)
         
@@ -899,7 +911,7 @@ def _simulate_worker(session_id, data):
         assert np.all(t_eval <= t_end), f"t_eval에 t_end보다 큰 값이 있음: max={np.max(t_eval):.6e}, t_end={t_end:.6e}"
         assert np.all(np.diff(t_eval) >= 0), "t_eval이 단조 증가하지 않음"
         
-        flush_print(f"✅ t_eval 생성 완료: {len(t_eval)}개 포인트, 범위=[{np.min(t_eval):.6e}, {np.max(t_eval):.6e}], t_span=[{t_start:.6e}, {t_end:.6e}]")
+        flush_print(f"t_eval 생성 완료: {len(t_eval)}개 포인트, 범위=[{np.min(t_eval):.6e}, {np.max(t_eval):.6e}], t_span=[{t_start:.6e}, {t_end:.6e}]")
 
         # transient 모드면 t_eval에서 실제로 사용될 V(t), J(t), Q_A(t)를 미리 계산해서 결과에 넣어둠
         # (사용자가 “열원이 반영됐는지”를 바로 확인할 수 있게 함)
@@ -1215,7 +1227,7 @@ def _simulate_worker(session_id, data):
         def pde_system(t, T_flat):
             # 취소 플래그 확인 (주기적으로 확인)
             if is_cancelled():
-                flush_print(f"🛑 시뮬레이션 취소됨 (session_id: {session_id}, t={t:.3f} s)")
+                flush_print(f"시뮬레이션 취소됨 (session_id: {session_id}, t={t:.3f} s)")
                 update_progress(0, '취소됨')
                 # 취소 예외 발생 (솔버가 중단됨)
                 raise ValueError("시뮬레이션이 취소되었습니다.")
@@ -1261,7 +1273,7 @@ def _simulate_worker(session_id, data):
             if t - last_print_time[0] >= 5.0:  # 5초마다 업데이트 (오버헤드 최소화)
                 # 취소 플래그 재확인
                 if is_cancelled():
-                    flush_print(f"🛑 시뮬레이션 취소됨 (session_id: {session_id}, t={t:.3f} s)")
+                    flush_print(f"시뮬레이션 취소됨 (session_id: {session_id}, t={t:.3f} s)")
                     update_progress(0, '취소됨')
                     raise ValueError("시뮬레이션이 취소되었습니다.")
                 
@@ -1409,7 +1421,7 @@ def _simulate_worker(session_id, data):
         
         # 솔버 실행 전 취소 플래그 확인
         if is_cancelled():
-            flush_print(f"🛑 시뮬레이션 취소됨 (솔버 실행 전, session_id: {session_id})")
+            flush_print(f"시뮬레이션 취소됨 (솔버 실행 전, session_id: {session_id})")
             update_progress(0, '취소됨')
             with progress_lock:
                 progress_store[session_id] = {
@@ -1454,7 +1466,7 @@ def _simulate_worker(session_id, data):
             else:
                 # 다른 ValueError는 그대로 전파
                 error_msg = f"솔버 실행 중 오류: {str(cancel_error)}"
-                flush_print(f"❌ {error_msg}")
+                flush_print(f"오류: {error_msg}")
                 flush_print(f"트레이스백:\n{traceback.format_exc()}")
                 update_progress(0, f'솔버 오류: {str(cancel_error)}')
                 raise ValueError(error_msg) from cancel_error
@@ -1490,9 +1502,9 @@ def _simulate_worker(session_id, data):
         
         # 온도가 비정상적으로 낮은지 확인
         if np.min(T_result) < 100:
-            flush_print(f"⚠️ 경고: 최소 온도가 100K 미만입니다! ({np.min(T_result):.2f} K)")
+            flush_print(f"경고: 최소 온도가 100K 미만입니다! ({np.min(T_result):.2f} K)")
         if np.max(T_result) < T_ambient:
-            flush_print(f"⚠️ 경고: 최대 온도가 주변 온도보다 낮습니다!")
+            flush_print(f"경고: 최대 온도가 주변 온도보다 낮습니다!")
         
         # 압축 제거로 z 좌표 복원 불필요 (원래 두께 사용)
         z_nm = z * 1e9
@@ -1530,12 +1542,12 @@ def _simulate_worker(session_id, data):
                     active_end_idx = last_layer_slice.stop - 1
                     flush_print(f"Cathode 레이어를 찾을 수 없음. 마지막 레이어 끝까지 사용: 인덱스 {active_end_idx}")
         except Exception as e:
-            flush_print(f"⚠️ Cathode 레이어 찾기 오류: {e}, 전체 범위 사용")
+            flush_print(f"경고: Cathode 레이어 찾기 오류: {e}, 전체 범위 사용")
             active_end_idx = len(z_nm) - 1
         
         # 활성층 범위 검증
         if active_end_idx < active_start_idx:
-            flush_print(f"⚠️ active_end_idx({active_end_idx}) < active_start_idx({active_start_idx}), 전체 범위 사용")
+            flush_print(f"경고: active_end_idx({active_end_idx}) < active_start_idx({active_start_idx}), 전체 범위 사용")
             active_end_idx = len(z_nm) - 1
         
         if active_end_idx >= len(z_nm):
@@ -1568,7 +1580,7 @@ def _simulate_worker(session_id, data):
         
         # 다운샘플링 필요 여부 확인
         if T_2d_raw.shape[0] > max_r_points or T_2d_raw.shape[1] > max_z_points:
-            flush_print(f"⚠️ temperature_2d 다운샘플링: {T_2d_raw.shape} → 최대 ({max_r_points}, {max_z_points})")
+            flush_print(f"경고: temperature_2d 다운샘플링: {T_2d_raw.shape} -> 최대 ({max_r_points}, {max_z_points})")
             # 균등 간격으로 다운샘플링
             r_indices = np.linspace(0, T_2d_raw.shape[0] - 1, min(max_r_points, T_2d_raw.shape[0]), dtype=int)
             z_indices_2d = np.linspace(0, T_2d_raw.shape[1] - 1, min(max_z_points, T_2d_raw.shape[1]), dtype=int)
@@ -1729,7 +1741,7 @@ def _simulate_worker(session_id, data):
             flush_print(f"온도 범위: {min(temp_profile_z_perovskite_r):.2f} ~ {max(temp_profile_z_perovskite_r):.2f} K")
         else:
             temp_profile_z_perovskite_r = []
-            flush_print(f"⚠️ 경고: perovskite_mid_idx가 유효하지 않습니다. 프로파일 2를 계산할 수 없습니다.")
+            flush_print(f"경고: perovskite_mid_idx가 유효하지 않습니다. 프로파일 2를 계산할 수 없습니다.")
         
         # 3. z=perovskite 중점, r=0에서 시간에 따른 온도 프로파일 (이미 계산됨: perovskite_center_temp)
         flush_print(f"=== 프로파일 3: z=perovskite 중점, r=0에서 시간에 따른 온도 ===")
@@ -1906,21 +1918,21 @@ if __name__ == '__main__':
     host = os.environ.get('HOST', '0.0.0.0')
     
     # 시작 메시지 출력 (로그 확인용)
-    print(f"🚀 Flask 앱 시작 중...")
-    print(f"📡 Host: {host}, Port: {port}")
-    print(f"🌐 환경 변수 PORT: {os.environ.get('PORT', '설정되지 않음')}")
+    print(f"Flask 앱 시작 중...")
+    print(f"Host: {host}, Port: {port}")
+    print(f"환경 변수 PORT: {os.environ.get('PORT', '설정되지 않음')}")
     sys.stdout.flush()
     
     try:
-        print(f"✅ 서버 시작: http://{host}:{port}")
+        print(f"서버 시작: http://{host}:{port}")
         sys.stdout.flush()
         app.run(debug=DEBUG_MODE, use_reloader=USE_RELOADER, port=port, host=host)
     except OSError as e:
         error_msg = str(e)
-        print(f"❌ 포트 오류: {error_msg}")
+        print(f"오류: 포트 오류: {error_msg}")
         sys.stdout.flush()
         if 'Address already in use' in error_msg or 'Port already in use' in error_msg:
-            print(f"⚠️ 포트 {port}가 이미 사용 중입니다.")
+            print(f"경고: 포트 {port}가 이미 사용 중입니다.")
             print(f"다른 포트(5001)로 시도합니다...")
             sys.stdout.flush()
             app.run(debug=DEBUG_MODE, use_reloader=USE_RELOADER, port=5001, host=host)
